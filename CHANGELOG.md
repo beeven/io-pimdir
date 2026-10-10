@@ -4,6 +4,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-10
+
 ### Added
 
 - Added `PimdirReader::sum_mail` and `PimdirMailSum`: the messages, known size and unknown sizes of a `[since, until)` range under the chips and a `held` chip, a message filed in several collections counted once (pimdir draft-04, STORAGE §14.1).
@@ -20,7 +22,7 @@ All notable changes to this project are documented in this file. The format is b
 - Changed a listing over a file holding its body to keep the size the body gave (pimdir draft-04, Annex A.7).
 - Changed `PimdirStore::delete_collection` to skip the store-wide refcount recompute when the collection held no object pointer.
 - Changed `PimdirStore::collect_before` to keep a mail a person's reference names (pimdir draft-04, STORAGE §11.3).
-- Changed `PimdirReader::count_mail`, `count_mail_by_day`, `count_unread` and `list_mail_page_filtered` to take a `since` floor on the sort key, seeked on the index, undated mail falling below it; `None` keeps the previous behaviour (pimdir draft-04, STORAGE §14.1).
+- Changed `PimdirReader::count_mail`, `count_mail_by_day`, `count_unread` and `list_mail_page_filtered` to take a `since` floor on the sort key, seeked on the index, undated mail falling below it; `None` keeps the previous behaviour (pimdir draft-04, STORAGE §14.1). **Breaking.**
 - Changed a listing or a `Meta` fetch over a mail placement holding its body to keep the size read from the body, as it keeps the attachment mark, a source's stated size being possibly an estimate (pimdir draft-04, Annex A.1).
 
 ## [0.7.0] - 2026-10-09
@@ -466,7 +468,8 @@ All notable changes to this project are documented in this file. The format is b
 - Collection generations (spec §15): the handle-space epoch on PimdirCollection and generation(), bumped atomically with a rebuild batch by write_rekeyed().
 - Read-only store open (open_read_only): opens an existing store with SQLITE_OPEN_READ_ONLY, never creates anything, refuses any other schema version, and exposes the full read surface for frontend processes that must be unable to write.
 
-[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.7.0..HEAD
+[Unreleased]: https://github.com/pimalaya/io-pimdir/compare/v0.8.0..HEAD
+[0.8.0]: https://github.com/pimalaya/io-pimdir/compare/v0.7.0..v0.8.0
 [0.7.0]: https://github.com/pimalaya/io-pimdir/compare/v0.6.0..v0.7.0
 [0.6.0]: https://github.com/pimalaya/io-pimdir/compare/v0.5.1..v0.6.0
 [0.5.1]: https://github.com/pimalaya/io-pimdir/compare/v0.5.0..v0.5.1
