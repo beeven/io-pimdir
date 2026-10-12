@@ -21,6 +21,15 @@ use crate::{
     summary::{PimdirAddress, PimdirDerivation, PimdirSummary, time, unfold},
 };
 
+/// The deepest multipart nesting the walk of the parts opens, the message
+/// itself at zero (Annex A.1).
+///
+/// A part nested deeper is neither examined for the attachment mark nor
+/// for the invitation. No mail agent nests near it, while a sender nesting
+/// further would otherwise cost the walk a stack frame and a rescan of the
+/// body per level.
+pub const MIME_DEPTH_MAX: usize = 64;
+
 /// The `mail_summary` row of a message with the people it names.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PimdirMailSummary {
@@ -92,10 +101,10 @@ impl PimdirMailSummary {
 pub fn derive(body: &[u8]) -> PimdirDerivation {
     let (headers, rest) = split_headers(body);
     let headers = header_fields(headers);
-    let attachment = has_attachment(&headers, rest);
+    let attachment = has_attachment(&headers, rest, 0);
 
     let mut summary = from_headers(&headers, Some(body.len() as u64), attachment);
-    summary.invitation = invitation(&headers, rest);
+    summary.invitation = invitation(&headers, rest, 0);
     summary.derivation()
 }
 
@@ -551,14 +560,19 @@ fn field<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// Whether the entity, or a part under it, carries `Content-Disposition:
-/// attachment`, walking multipart bodies by their boundary.
-fn has_attachment(headers: &[(String, String)], body: &[u8]) -> bool {
+/// Whether the entity, nested `depth` multipart levels down, or a part under
+/// it, carries `Content-Disposition: attachment`, walking multipart bodies by
+/// their boundary down to [`MIME_DEPTH_MAX`].
+fn has_attachment(headers: &[(String, String)], body: &[u8], depth: usize) -> bool {
     if field(headers, "content-disposition")
         .and_then(|value| value.split(';').next())
         .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"))
     {
         return true;
+    }
+
+    if depth >= MIME_DEPTH_MAX {
+        return false;
     }
 
     let Some(boundary) = field(headers, "content-type").and_then(boundary) else {
@@ -567,13 +581,15 @@ fn has_attachment(headers: &[(String, String)], body: &[u8]) -> bool {
 
     parts(body, &boundary).into_iter().any(|part| {
         let (headers, body) = split_headers(part);
-        has_attachment(&header_fields(headers), body)
+        has_attachment(&header_fields(headers), body, depth + 1)
     })
 }
 
 /// The first `UID` of the first `text/calendar` part in document order,
-/// its transfer encoding undone and its lines unfolded (Annex A.1).
-fn invitation(headers: &[(String, String)], body: &[u8]) -> Option<String> {
+/// its transfer encoding undone and its lines unfolded (Annex A.1), the
+/// entity nested `depth` multipart levels down and the walk stopping at
+/// [`MIME_DEPTH_MAX`].
+fn invitation(headers: &[(String, String)], body: &[u8], depth: usize) -> Option<String> {
     let content_type = field(headers, "content-type").unwrap_or_default();
     let media = content_type
         .split(';')
@@ -596,10 +612,14 @@ fn invitation(headers: &[(String, String)], body: &[u8]) -> Option<String> {
         });
     }
 
+    if depth >= MIME_DEPTH_MAX {
+        return None;
+    }
+
     let boundary = boundary(content_type)?;
     parts(body, &boundary).into_iter().find_map(|part| {
         let (headers, body) = split_headers(part);
-        invitation(&header_fields(headers), body)
+        invitation(&header_fields(headers), body, depth + 1)
     })
 }
 
@@ -716,11 +736,11 @@ mod tests {
     fn an_attachment_is_found_under_a_nested_multipart() {
         let body = b"Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n--outer\r\nContent-Type: multipart/alternative; boundary=inner\r\n\r\n--inner\r\nContent-Type: text/plain\r\n\r\nhi\r\n--inner--\r\n--outer\r\nContent-Disposition: attachment; filename=a.pdf\r\n\r\n%PDF\r\n--outer--\r\n";
         let (headers, rest) = split_headers(body);
-        assert!(has_attachment(&header_fields(headers), rest));
+        assert!(has_attachment(&header_fields(headers), rest, 0));
 
         let plain = b"Content-Type: text/plain\r\n\r\nhi\r\n";
         let (headers, rest) = split_headers(plain);
-        assert!(!has_attachment(&header_fields(headers), rest));
+        assert!(!has_attachment(&header_fields(headers), rest, 0));
     }
 
     #[test]

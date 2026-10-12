@@ -934,6 +934,51 @@ fn check_mutable_model(ops: Vec<MutOp>, relocates: bool) -> Result<(), TestCaseE
         hydrate(&mut client, "inbox");
     }
 
+    // NOTE: a move whose arrival holds another body than the create staged,
+    // a server edit relocated with it, parks in the archive (SYNC §6); the
+    // model settles it on the server's body, which claims nothing
+    for round in 0..3 {
+        let conflicted: Vec<PimdirHandle> = client
+            .storage()
+            .rows("archive")
+            .into_iter()
+            .filter(|p| p.status == PimdirStatus::Conflict)
+            .map(|p| p.handle)
+            .collect();
+        if conflicted.is_empty() {
+            break;
+        }
+        prop_assert!(round < 2, "conflict resolution must terminate");
+
+        let _ = client.upgrade("archive", conflicted.clone(), PimdirTier::Full);
+        for handle in conflicted {
+            let placement = client.storage().placement("archive", handle.as_str());
+            let Some(hash) = placement.conflict_object else {
+                continue;
+            };
+            let body = client.storage().body(&hash).unwrap_or_default();
+            let object = PimdirObject {
+                hash,
+                size: body.len(),
+            };
+            client
+                .mutate(
+                    "archive",
+                    PimdirMutation::Edit {
+                        sort_key: Default::default(),
+                        handle,
+                        object,
+                        body,
+                        summary: None,
+                    },
+                )
+                .unwrap();
+        }
+        client.sync("archive", opts.clone()).unwrap();
+        client.sync("archive", opts.clone()).unwrap();
+        hydrate(&mut client, "archive");
+    }
+
     for _ in 0..2 {
         client.sync("inbox", opts.clone()).unwrap();
         hydrate(&mut client, "inbox");

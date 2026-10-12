@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- Added `summary::mail::MIME_DEPTH_MAX` (64), the deepest multipart level the walk of a message's parts opens.
+
+### Fixed
+
+- Fixed a stack overflow deriving a message nested thousands of multipart levels deep (about 350 KB on a 1 MiB stack): the walk for the attachment mark and the invitation stops at `MIME_DEPTH_MAX`. Fixed the same for a calendar body nesting components deeply, whose tree now keeps the three levels the derivation reads.
+
+- Fixed a page landing a pending create over a mutable arrival holding another body: the arrival's body became the base and the staged one was pushed over it, so two servers holding one `UID` under two bodies ended with one of them. It is now the both-changed case, the conflict policy deciding (pimdir SYNC §6).
+
 ## [0.8.0] - 2026-10-10
 
 ### Added

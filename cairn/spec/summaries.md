@@ -30,3 +30,9 @@ A calendar `sort_key` SHALL resolve a zoned start through the `VTIMEZONE` the re
 
 ### Requirement: The derivations are checked against the format's vectors
 tests/summaries.rs SHALL run every case of the specification's vectors/summaries.json: the fixture's names under both hashes, the key (the minted one where the case states a hint and a handle), the summary row, the address rows, the sort key and, for mail, the mark read without the body (`meta_attachment`) with every other column agreeing, compared as parsed structures, skipping when the spec checkout is absent.
+
+### Requirement: The walk of a body is bounded in depth
+The walk of a message's parts SHALL open multipart bodies down to `summary::mail::MIME_DEPTH_MAX` (64) levels, the message itself at zero: a part nested deeper is examined neither for the attachment mark nor for the invitation. The calendar derivation SHALL keep components down to the third level (an observance under a `VTIMEZONE` under the `VCALENDAR`), the deepest any column reads, dropping deeper ones as they close. Either walk SHALL fit a 1 MiB stack whatever the body nests, a sender controlling both trees. pimdir Annex A.1 states no depth yet: a deviation until it does, bounded to messages no mail agent writes.
+
+#### Scenario: Deep nesting derives within a small stack
+- tests/deep_nesting.rs, each case on a 1 MiB thread: 10000 multipart levels and 200000 nested components derive; the walk reaches a part at the bound and not one past it.

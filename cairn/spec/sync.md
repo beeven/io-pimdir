@@ -134,7 +134,7 @@ A member absent from a complete enumeration, or listed vanished by a delta, whos
 - THEN its handle is dropped `Superseded`, the body sits on a `Created` placement under the provisional handle, and the next sync appends it
 
 ### Requirement: A create waits for the page that lands it
-A `Created` placement SHALL derive no `Add` from a page before the last of a round, nor from a delta while a round is open (pimdir SYNC §5, vectors/sync/25): a page not landed yet may carry the create arrived, by a relocation or an add whose record was lost, and the page naming it lands the create; pushing first lands two copies. A member a page lists in the same run is named before any create is derived, so a page carrying the arrival lands it rather than pushing (vectors/sync/21). A pending create carrying no origin whose summary `date` the run's scope excludes SHALL wait for a round whose scope holds it, an arrival relocated with its `Date` kept being listed by no page of that scope, and is counted in `PimdirSyncReport::waiting` (vectors/sync/43).
+A `Created` placement SHALL derive no `Add` from a page before the last of a round, nor from a delta while a round is open (pimdir SYNC §5, vectors/sync/25): a page not landed yet may carry the create arrived, by a relocation or an add whose record was lost, and the page naming it lands the create; pushing first lands two copies. A member a page lists in the same run is named before any create is derived, so a page carrying the arrival lands it rather than pushing (vectors/sync/21). A pending create carrying no origin whose summary `date` the run's scope excludes SHALL wait for a round whose scope holds it, an arrival relocated with its `Date` kept being listed by no page of that scope, and is counted in `PimdirSyncReport::waiting` (vectors/sync/43). A mutable arrival carrying a body other than the staged one SHALL land as the both-changed case (pimdir SYNC §6): its base holds neither body nor revision, the staged body and the arrival's flags stay, and the policy decides. Landing it on the arrival's body as the base read the staged body as an edit and pushed it over a body the two never agreed on.
 
 #### Scenario: A copy into a collection never listed
 - GIVEN a pending create in a target whose first listing carries other members
@@ -145,6 +145,11 @@ A `Created` placement SHALL derive no `Add` from a page before the last of a rou
 - GIVEN a pending create dated August and a run over a scope since September
 - WHEN the round's last page lands without it
 - THEN no `Add` is derived and the report counts it waiting
+
+#### Scenario: Two servers holding one identity under two bodies
+- GIVEN a source holding a card and a second source whose server holds the same `UID` under another body, the hub offering the first as a pending create
+- WHEN the second source syncs under `Manual`
+- THEN the create lands conflicted, its body the staged one and the server's recorded as the divergence, the base holding no body, and nothing is pushed
 
 ### Requirement: An item-level conflict is held, a binding conflict is reconciled
 `reconcile_content` SHALL take its conflict branch for a placement carrying a `conflict_revision`, the divergence between this source and its own remote. A `Conflict` placement carrying none is the item's cross-source conflict projected onto this source ([hub](hub.md)): it SHALL derive no push, a pending create under it included, until an `Edit` or a `Remove` settles the item (pimdir SYNC §3, §7). A remote revision its base does not hold SHALL still be recorded, whatever the conflict policy: the binding is marked conflicted with that revision and its diverging body wanted, reported as `Conflicted`, since an incremental enumeration never lists the member again (pimdir SYNC §5, vectors/sync/33).

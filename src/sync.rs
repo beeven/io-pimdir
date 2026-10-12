@@ -827,7 +827,10 @@ impl PimdirSync {
     /// listing reported: its flags, the revision, and the body it carried
     /// or else the create's own. The flags, body, summary and sort key
     /// staged on the create stay, so an edit made on it still pushes
-    /// (SYNC §6). The join drops the provisional handle, `Superseded`.
+    /// (SYNC §6). A mutable arrival carrying another body than the staged
+    /// one is the both-changed case instead: the two never agreed on a
+    /// body, so the base holds neither and the content axis follows the
+    /// policy. The join drops the provisional handle, `Superseded`.
     fn land(&mut self, create: PimdirPlacement, item: &PimdirRemoteItem) -> PimdirPlacement {
         debug!(
             "land the pending create {} under {}",
@@ -837,8 +840,20 @@ impl PimdirSync {
 
         let mut landed = create;
         landed.handle = item.handle.clone();
+
+        let diverged = item.revision.is_some()
+            && item.meta.body.as_ref().is_some_and(|body| {
+                landed
+                    .object
+                    .as_ref()
+                    .is_some_and(|staged| staged != body.hash())
+            });
+
+        // NOTE: a diverging body is left to the content axis, which records
+        // it as the conflict's own; taking it as the base would read the
+        // staged body as an edit and push it over the arrival.
         let mut base_object = landed.object.clone();
-        if let Some(body) = item.meta.body.clone() {
+        if !diverged && let Some(body) = item.meta.body.clone() {
             let hash = self.store_body(body);
             base_object = Some(hash.clone());
             landed.object.get_or_insert(hash);
@@ -853,10 +868,17 @@ impl PimdirSync {
             Some(_) => PimdirLevel::Full,
             None => PimdirLevel::Meta,
         };
-        landed.base = Some(PimdirBase {
-            flags: item.flags.clone(),
-            revision: item.revision.clone(),
-            object: base_object,
+        landed.base = Some(match diverged {
+            true => PimdirBase {
+                flags: item.flags.clone(),
+                revision: None,
+                object: None,
+            },
+            false => PimdirBase {
+                flags: item.flags.clone(),
+                revision: item.revision.clone(),
+                object: base_object,
+            },
         });
         landed.status = match landed.base.as_ref() {
             Some(base) if base.flags == landed.flags && base.object == landed.object => {

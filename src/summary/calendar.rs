@@ -551,6 +551,10 @@ fn components(body: &[u8]) -> Vec<Component> {
         .collect()
 }
 
+/// The deepest component a derivation reads, the root at one: an
+/// observance under a `VTIMEZONE` under the `VCALENDAR`.
+const DEPTH: usize = 3;
+
 /// One `BEGIN`/`END` block and what it holds.
 struct Component {
     name: String,
@@ -572,6 +576,10 @@ impl Component {
 
 /// Reads unfolded lines into the components they open and close; a
 /// block whose `END` never arrives still closes at the end of the body.
+///
+/// A block nested past [`DEPTH`] is dropped as it closes, so the tree
+/// holds no deeper level, nor drops one recursively, however deep the
+/// body nests.
 fn parse(lines: &[String]) -> Vec<Component> {
     let mut roots = Vec::new();
     let mut stack: Vec<Component> = Vec::new();
@@ -588,6 +596,9 @@ fn parse(lines: &[String]) -> Vec<Component> {
             }),
             "END" => {
                 let Some(closed) = stack.pop() else { continue };
+                if stack.len() >= DEPTH {
+                    continue;
+                }
                 match stack.last_mut() {
                     Some(parent) => parent.children.push(closed),
                     None => roots.push(closed),
@@ -602,6 +613,9 @@ fn parse(lines: &[String]) -> Vec<Component> {
     }
 
     while let Some(unclosed) = stack.pop() {
+        if stack.len() >= DEPTH {
+            continue;
+        }
         match stack.last_mut() {
             Some(parent) => parent.children.push(unclosed),
             None => roots.push(unclosed),
