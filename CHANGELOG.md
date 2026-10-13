@@ -6,6 +6,9 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Added stand-ins recorded as a body enters (pimdir draft-04, STORAGE §14.3): a write bringing a message's body into the store records, in its transaction, one file at `Meta` per part carrying `Content-Disposition: attachment` in the account's attachments collection (the file collection with the role `attachments`, else `<account>/\u0001attachments`, declared with that role) and the `attachment` reference from the message, whatever wrote the body (a sync, an upgrade, a drained `add`, a direct write). A body the account already held under its key (a move, a copy, a second label, the same body again) walks nothing, and bodies held before are never backfilled.
+- Added `summary::mail::attachments`: `PimdirAttachmentWalk`, the walk of a message's parts fed a chunk at a time with bounded memory, and `attachments(body)`, answering each attachment's section, name, media type and decoded size as a `PimdirFileSummary`; `ATTACHMENTS_MAX`, `HEADER_MAX` and `LINE_HEAD`.
+
 - Added round heads (pimdir draft-04, SYNC §4, §5). A run resuming an open round first asks for the round's head, so a message arriving during a long round shows at the next run rather than once the round has closed.
   - The connector side: `PimdirRemote::heads` (default none), `PimdirHeads`, `PimdirHead` (`Delta` from a checkpoint, `Band` from the instant the round opened), `PimdirListing::Head`, `PimdirEnumerate::head`, `PimdirEnumerated::HeadRejected` and `NoHead`, and `PimdirRemoteSnapshot::band_head`; `PimdirSync::heads` for a runner of its own, which `PimdirSourceStore::sync` sets from the remote.
   - A delta head stamps its members and records its checkpoint as the round's. A band head stamps nothing and records nothing, and a connector listing band heads lists the band again in every round's last page.

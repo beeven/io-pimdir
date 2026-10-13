@@ -36,3 +36,9 @@ The walk of a message's parts SHALL open multipart bodies down to `summary::mail
 
 #### Scenario: Deep nesting derives within a small stack
 - tests/deep_nesting.rs, each case on a 1 MiB thread: 10000 multipart levels and 200000 nested components derive; the walk reaches a part at the bound and not one past it.
+
+### Requirement: The walk of a message's parts is streamed and bounded
+`summary::mail::attachments::PimdirAttachmentWalk` SHALL take a body a chunk at a time and keep at most `HEADER_MAX` octets of a header block, `LINE_HEAD` of any other line, one boundary per open level down to `MIME_DEPTH_MAX` and `ATTACHMENTS_MAX` summaries, answering the same whatever the chunking; it SHALL stand for exactly the parts the attachment mark's walk examines and finds disposed as attachments, a part no delimiter ends being none.
+
+#### Scenario: The vectors' attachments
+- tests/summaries.rs, the walk fed whole and in chunks of 7 octets; the unit tests of src/summary/mail/attachments.rs.

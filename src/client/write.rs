@@ -20,7 +20,10 @@ use rusqlite::{
 
 use crate::{
     change::{PimdirDropReason, PimdirWriteOp},
-    client::{PimdirError, PimdirSourceStore, blobs::PimdirBlobs, busy_or_sql, release_pins, rows},
+    client::{
+        PimdirError, PimdirSourceStore, attachments, blobs::PimdirBlobs, busy_or_sql, release_pins,
+        rows,
+    },
     codec,
     collection::{
         PimdirCheckpoint, PimdirCollectionId, PimdirCoverage, PimdirCursor, PimdirRound,
@@ -356,9 +359,15 @@ pub(crate) fn apply(
         let old = read_hub(tx, &collection, Some(&links))?;
         let mut new = old.clone();
         new.absorb(source, &ops);
+        // NOTE: read before the diff is saved, which would make every
+        // body it stores look held already (§14.3).
+        let entering = attachments::entering(tx, &collection, &old, &new)?;
         let licensed = licensed.remove(&collection).unwrap_or_default();
         save_hub_diff(tx, &collection, source, &ops, &old, &mut new, &licensed)?;
         adjust_refcounts(tx, &object_refs(&old), &object_refs(&new))?;
+        if let Some(entering) = entering {
+            attachments::record(tx, blobs, entering)?;
+        }
     }
 
     // NOTE: after the upserts, so a binding the batch inserted is stamped

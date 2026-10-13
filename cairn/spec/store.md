@@ -966,10 +966,13 @@ A collection of kind `application/octet-stream` (`summary::file::KIND`) SHALL ho
 - tests/files.rs `an_earlier_store_gains_the_files_on_open`.
 
 ### Requirement: The writer records the automatic references
-A write recording an item's summary SHALL run the canonical rule statements for it (STORAGE §14.2): `link_senders_of` for a mail, and `link_invitations_of` when it carries an invitation; `link_mail_from` for a contact; `link_invitations_to` for a calendar item. Each records origin `auto` from the mail to what it names, never twice and never over a person's reference. `PimdirMailSummary::invitation` SHALL be derived with the body (Annex A.1) and kept over a write without it; opening a store as its owner SHALL add the column and `mail_summary_by_invitation` when absent.
+A write recording an item's summary SHALL run the canonical rule statements for it (STORAGE §14.2): `link_senders_of` for a mail, and `link_invitations_of` when it carries an invitation; `link_mail_from` for a contact; `link_invitations_to` for a calendar item. Each records origin `auto` from the mail to what it names, never twice and never over a person's reference, and never removes one: a link made at the write stays when its end later changes. `PimdirMailSummary::invitation` SHALL be derived with the body (Annex A.1) and kept over a write without it; opening a store as its owner SHALL add the column and `mail_summary_by_invitation` when absent.
 
 #### Scenario: Whichever end lands first
 - tests/references.rs `the_writer_records_the_automatic_references`.
+
+#### Scenario: Linked at the write, never recomputed
+- tests/references.rs `a_rule_links_at_the_write_and_never_recomputes`: the sender at `Meta`, the invitation once the body states it, both kept when the contact drops the address.
 
 ### Requirement: The audit's answers and the linking reads
 `PimdirReader::sum_mail` SHALL count a message once across the set and take a `held` chip. `summary::file::part_key` SHALL answer `None` for a message under a writer-derived key, and `add_reference` SHALL answer the reference standing, new or not, `None` only for an end missing or derived. `PimdirStore::delete_unbound` SHALL delete an item no source binds and release its pins; `delete_collection` SHALL skip the recompute when `collection_holds_objects` answers false. `get_mail_row`, `describe_endpoint`, `search_contacts`, `search_calendar`, `search_files` and `list_attachments_by_account` SHALL answer their canonical statements, none on a store lacking a table they name. Opening a store as its owner SHALL rebuild `collections` when its role `CHECK` lacks `attachments`, and backfill `mail_summary.invitation` from the held bodies when it adds the column (STORAGE §6).
@@ -985,3 +988,9 @@ Opening a store as its owner SHALL refuse one missing a core table or trigger (`
 
 #### Scenario: An older shape reconciled
 - tests/files.rs `an_earlier_role_constraint_is_rebuilt_on_open` (the rebuilt text equals a fresh store's), tests/scoped_sync.rs `an_earlier_draft_store_is_reconciled_on_open`, tests/linking.rs `an_earlier_store_backfills_the_invitation_on_open`, tests/references.rs `an_earlier_store_gains_the_references_on_open`.
+
+### Requirement: A body entering the store stands for its attachments
+A write SHALL record, in its transaction, the stand-ins of every `message/rfc822` body it brings into the store (STORAGE §14.3): a body a live, stored item under a key naming an identity gains, which `lookup_objects` did not find under that key in the account before the write. Each part `summary::mail::attachments` answers SHALL get a file at `Meta` holding no body in the account's attachments collection, keyed `part:`, with its `file_summary`, unless the collection holds it, and an `auto` `attachment` reference from the message. The collection SHALL be the account's file collection with the role `attachments`, else `<account>/\u0001attachments` (`\u0001attachments` with no account) declared with the file kind, the name `attachments` and the role. A body filed again, stored again or held before SHALL walk nothing: no backfill, no recompute.
+
+#### Scenario: Recorded once, as the body enters
+- tests/attachments.rs; sync vector 70 in tests/vectors_sync.rs.

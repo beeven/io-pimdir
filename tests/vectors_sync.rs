@@ -820,10 +820,13 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
             "SELECT collection, source, checkpoint, round, round_started_at, round_since, round_until, round_cursor, round_checkpoint, covered_at, covered_since, covered_until, round_band FROM sources ORDER BY collection, source"
         }
         "collections" => {
-            "SELECT id, account, kind, conflict, generation FROM collections ORDER BY id"
+            "SELECT id, account, kind, conflict, generation, name, role FROM collections ORDER BY id"
         }
         "addresses" => {
             "SELECT collection, link_id, role, position, address, name FROM item_address ORDER BY collection, link_id, role, position"
+        }
+        "references" => {
+            "SELECT from_kind, from_link_id, to_kind, to_link_id, role, origin FROM item_reference ORDER BY from_kind, from_link_id, to_kind, to_link_id, role"
         }
         _ => panic!("unknown table {table}"),
     };
@@ -901,6 +904,8 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
                     get("kind", json!(row.get::<_, String>(2)?));
                     get("conflict", json!(row.get::<_, String>(3)?));
                     get("generation", json!(row.get::<_, i64>(4)?));
+                    get("name", json!(row.get::<_, String>(5)?));
+                    get("role", json!(row.get::<_, Option<String>>(6)?));
                 }
                 "addresses" => {
                     get("collection", json!(row.get::<_, String>(0)?));
@@ -909,6 +914,14 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
                     get("position", json!(row.get::<_, i64>(3)?));
                     get("address", json!(row.get::<_, String>(4)?));
                     get("name", json!(row.get::<_, Option<String>>(5)?));
+                }
+                "references" => {
+                    get("from_kind", json!(row.get::<_, String>(0)?));
+                    get("from_link_id", json!(row.get::<_, String>(1)?));
+                    get("to_kind", json!(row.get::<_, String>(2)?));
+                    get("to_link_id", json!(row.get::<_, String>(3)?));
+                    get("role", json!(row.get::<_, String>(4)?));
+                    get("origin", json!(row.get::<_, String>(5)?));
                 }
                 _ => unreachable!(),
             }

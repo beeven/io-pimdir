@@ -363,3 +363,102 @@ fn the_writer_records_the_automatic_references() {
         "the sender before and after, the event after its invitation"
     );
 }
+
+#[test]
+fn a_rule_links_at_the_write_and_never_recomputes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seeded(dir.path());
+    store.ensure_collection("Cal", "text/calendar").unwrap();
+    let address = |address: &str| PimdirAddress {
+        address: address.into(),
+        name: None,
+    };
+    let summarised = |collection: &str, handle: &str, link: &str, summary: PimdirSummary| {
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            summary: Some(summary),
+            ..placement(collection, handle, link)
+        })
+    };
+    let card = |email: &str| {
+        PimdirSummary::Contact(PimdirContactSummary {
+            full_name: "Dave".into(),
+            emails: vec![address(email)],
+            ..Default::default()
+        })
+    };
+    let mail = |invitation: Option<&str>| {
+        PimdirSummary::Mail(PimdirMailSummary {
+            subject: "Planning".into(),
+            invitation: invitation.map(Into::into),
+            from: vec![address("dave@example.org")],
+            ..Default::default()
+        })
+    };
+    let read = |store: &PimdirSourceStore| -> Vec<(String, String)> {
+        store
+            .references_from(&endpoint(MAIL, "plan"))
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.to.link_id.0, r.role.as_str().to_string()))
+            .collect()
+    };
+
+    store
+        .write(vec![
+            summarised("Cards", "d", "dave", card("dave@example.org")),
+            summarised(
+                "Cal",
+                "e",
+                "ev2",
+                PimdirSummary::Event(PimdirEventSummary {
+                    uid: Some("ev2".into()),
+                    summary: "Planning".into(),
+                    ..Default::default()
+                }),
+            ),
+        ])
+        .unwrap();
+
+    // NOTE: named without its body, the mail links its sender; the
+    // invitation waits for the body that states it.
+    store
+        .write(vec![PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            object: None,
+            level: PimdirLevel::Meta,
+            base: None,
+            ..placement("INBOX", "7", "plan")
+        })])
+        .unwrap();
+    store
+        .write(vec![summarised("INBOX", "7", "plan", mail(None))])
+        .unwrap();
+    assert_eq!(read(&store), [("dave".into(), "sender".into())]);
+
+    store
+        .write(vec![summarised("INBOX", "7", "plan", mail(Some("ev2")))])
+        .unwrap();
+    assert_eq!(
+        read(&store),
+        [
+            ("dave".into(), "sender".into()),
+            ("ev2".into(), "invitation".into())
+        ]
+    );
+
+    // NOTE: the contact drops the address later: the link stays.
+    store
+        .write(vec![summarised(
+            "Cards",
+            "d",
+            "dave",
+            card("d@example.net"),
+        )])
+        .unwrap();
+    assert_eq!(
+        read(&store),
+        [
+            ("dave".into(), "sender".into()),
+            ("ev2".into(), "invitation".into())
+        ]
+    );
+}

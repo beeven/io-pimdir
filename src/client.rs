@@ -47,6 +47,7 @@ pub mod diagnostics;
 pub mod producer;
 pub mod reader;
 
+mod attachments;
 mod lock;
 mod run;
 #[doc(inline)]
@@ -369,49 +370,11 @@ impl PimdirStore {
                         ":sort_key": summary.sort_key().0,
                     },
                 )?;
+                attachments::upsert_file_summary(&tx, collection, link_id, summary)?;
                 seq
             }
-            None => {
-                let shared: Option<i64> = tx
-                    .query_row(
-                        sql::SEQ_FOR_LINK_ANY,
-                        named_params! { ":link_id": link_id.as_str() },
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                let seq = match shared {
-                    Some(seq) => seq,
-                    None => tx.query_row(sql::BUMP_NEXT_SEQ, [], |row| row.get(0))?,
-                };
-                tx.execute(
-                    sql::INSERT_ITEM,
-                    named_params! {
-                        ":collection": collection,
-                        ":link_id": link_id.as_str(),
-                        ":seq": seq,
-                        ":flags": "[]",
-                        ":object_hash": None::<String>,
-                        ":sort_key": summary.sort_key().0,
-                        ":level": 1,
-                        ":deleted": 0,
-                        ":conflicted": 0,
-                        ":conflict_object": None::<String>,
-                    },
-                )?;
-                seq
-            }
+            None => attachments::insert_file(&tx, collection, link_id, summary)?,
         };
-        tx.execute(
-            sql::UPSERT_FILE_SUMMARY,
-            named_params! {
-                ":collection": collection,
-                ":link_id": link_id.as_str(),
-                ":name": summary.name,
-                ":media_type": summary.media_type,
-                ":size": summary.size.map(|size| size as i64),
-                ":part": summary.part,
-            },
-        )?;
         tx.commit().map_err(busy_or_sql)?;
         Ok(seq)
     }

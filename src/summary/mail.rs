@@ -10,6 +10,8 @@
 //! the way a listing names a member, the attachment mark read without
 //! the body.
 
+pub mod attachments;
+
 use alloc::{
     format,
     string::{String, ToString},

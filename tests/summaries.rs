@@ -234,5 +234,28 @@ fn every_summary_vector_derives() {
             assert_eq!(meta.link_id, derivation.link_id, "{label}: meta link id");
             assert_eq!(meta.sort_key, derivation.sort_key, "{label}: meta sort key");
         }
+
+        // NOTE: the stand-ins' parts (STORAGE §14.3, Annex A.7), the walk fed
+        // whole and a few octets at a time alike.
+        if let Some(expected) = case.get("attachments") {
+            let whole = mail::attachments::attachments(&body);
+            let mut walk = mail::attachments::PimdirAttachmentWalk::new();
+            for chunk in body.chunks(7) {
+                walk.feed(chunk);
+            }
+            assert_eq!(walk.finish(), whole, "{label}: attachments fed in chunks");
+            let actual: Vec<Value> = whole
+                .iter()
+                .map(|file| {
+                    json!({
+                        "part": file.part,
+                        "name": file.name,
+                        "media_type": file.media_type,
+                        "size": file.size,
+                    })
+                })
+                .collect();
+            assert_eq!(&Value::from(actual), expected, "{label}: attachments");
+        }
     }
 }
