@@ -11,7 +11,11 @@
 //! refreshes its summary. A round is answered in pages, each landing in
 //! one write with its resume cursor and the round's stamp on every
 //! binding it listed; deletes are inferred once, when the last page
-//! lands, from the bindings in scope no page stamped. A scope bounds
+//! lands, from the bindings in scope no page stamped. A run resuming an
+//! open round first lists its head, what changed since the round began,
+//! when the connector lists one: a delta head is stamped and moves the
+//! checkpoint the round closes on, a band head is neither, the round's
+//! last page deciding its members. A scope bounds
 //! what absence means and nothing else: the engine filters no page by
 //! date, explicit removals apply whatever the date, local changes push
 //! whatever the scope, and a `Remove` comes from a staged tombstone and
@@ -50,8 +54,9 @@ use crate::{
         PimdirStatus,
     },
     remote::{
-        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirListing, PimdirPushOutcome,
-        PimdirPushResult, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirHead, PimdirHeads,
+        PimdirListing, PimdirPushOutcome, PimdirPushResult, PimdirRemoteItem, PimdirRemoteMeta,
+        PimdirRemoteSnapshot,
     },
     summary::{self, PimdirSummary},
     sync::join::{Candidate, Join, Merge, Narrowing, Remote},
@@ -215,6 +220,11 @@ pub struct PimdirSync {
     /// Whether the connector's checkpoint is bound to the scope it was
     /// made under (SYNC §4), else a widening lists only the band.
     scope_bound: bool,
+    /// The heads the connector lists while a round is open (SYNC §4).
+    heads: PimdirHeads,
+    /// The head this run lists before the open round's next page, until
+    /// the connector answers it (SYNC §5).
+    head: Option<PimdirHead>,
     /// The source's checkpoint and coverage as the run found them.
     checkpoint: Option<PimdirCheckpoint>,
     coverage: Option<PimdirCoverage>,
@@ -287,6 +297,8 @@ impl PimdirSync {
             opts,
             beside_others: false,
             scope_bound: true,
+            heads: PimdirHeads::NONE,
+            head: None,
             checkpoint: None,
             coverage: None,
             round_open: false,
@@ -324,6 +336,15 @@ impl PimdirSync {
     /// coverage lacks, keeping its checkpoint. Bound by default.
     pub fn scope_bound(mut self, bound: bool) -> Self {
         self.scope_bound = bound;
+        self
+    }
+
+    /// Tells the coroutine which heads the connector lists (SYNC §4,
+    /// [`PimdirRemote::heads`](crate::remote::PimdirRemote::heads)): a run
+    /// resuming an open round lists its head first, so what arrived since
+    /// the round began shows before the round closes. None by default.
+    pub fn heads(mut self, heads: PimdirHeads) -> Self {
+        self.heads = heads;
         self
     }
 
@@ -389,16 +410,42 @@ impl PimdirSync {
         }
     }
 
-    /// Asks the connector for the next page of the planned listing.
+    /// The head a run resuming `round` lists first (SYNC §5): a delta
+    /// head from the round's checkpoint, or for a band round, which
+    /// carries none of its own, from the source's; else a band head from
+    /// the instant the round opened; else none.
+    fn head_of(&self, round: &PimdirRound) -> Option<PimdirHead> {
+        let position = match (&round.checkpoint, round.band) {
+            (Some(checkpoint), _) => Some(checkpoint.clone()),
+            (None, true) => self.checkpoint.clone(),
+            (None, false) => None,
+        };
+        match position {
+            Some(checkpoint) if self.heads.delta => Some(PimdirHead::Delta(checkpoint)),
+            _ if self.heads.band => Some(PimdirHead::Band {
+                since: round.started_at.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Asks the connector for the next page of the planned listing, the
+    /// open round's head first when the run lists one.
     fn enumerate(
         &mut self,
     ) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
-        let request = match &self.plan {
-            Plan::Delta(checkpoint) => PimdirEnumerate {
+        let request = match (&self.head, &self.plan) {
+            // NOTE: checked against the scope the run asks for, not the
+            // band a band round lists (SYNC §5).
+            (Some(head), _) => PimdirEnumerate {
+                listing: PimdirListing::Head(head.clone()),
+                scope: self.opts.scope.clone(),
+            },
+            (None, Plan::Delta(checkpoint)) => PimdirEnumerate {
                 listing: PimdirListing::Delta(checkpoint.clone()),
                 scope: self.opts.scope.clone(),
             },
-            Plan::Round(round) => PimdirEnumerate {
+            (None, Plan::Round(round)) => PimdirEnumerate {
                 listing: PimdirListing::Round {
                     cursor: round.cursor.clone(),
                     band: round.band,
@@ -443,6 +490,25 @@ impl PimdirSync {
         self.enumerate()
     }
 
+    /// Restarts the round over the scope the run asks for, never a band,
+    /// the source having refused the position its head listed from: the
+    /// checkpoint the round would close with is void (SYNC §5).
+    fn head_rejected(
+        &mut self,
+    ) -> PimdirCoroutineState<PimdirYield, <Self as PimdirCoroutine>::Return> {
+        debug!("head position rejected, restart the round over the scope");
+        self.head = None;
+        let scope = self.opts.scope.clone();
+        self.plan = Plan::Round(RoundPlan {
+            span: scope.clone(),
+            scope,
+            band: false,
+            cursor: None,
+            open: true,
+        });
+        self.enumerate()
+    }
+
     /// Takes a page in: what it is, and the load naming it needs (SYNC
     /// §10): the whole collection for a delta and a round's last page,
     /// which reason about what is missing from it, the handles it lists
@@ -469,9 +535,20 @@ impl PimdirSync {
         }
         items.dedup_by(|a, b| a.handle == b.handle);
 
-        let kind = match complete {
-            false => PageKind::Delta,
-            true => {
+        // NOTE: a head is one page whatever it says: it never moves the
+        // round's cursor, and a band head lands no checkpoint (SYNC §5).
+        let head = self.head.take();
+        let (cursor, checkpoint) = match head {
+            Some(PimdirHead::Delta(_)) => (None, checkpoint),
+            Some(PimdirHead::Band { .. }) => (None, None),
+            None => (cursor, checkpoint),
+        };
+
+        let kind = match (head, complete) {
+            (Some(PimdirHead::Delta(_)), _) => PageKind::DeltaHead,
+            (Some(PimdirHead::Band { .. }), _) => PageKind::BandHead,
+            (None, false) => PageKind::Delta,
+            (None, true) => {
                 // NOTE: a connector answering a round to a delta request
                 // listed the whole scope, a round of its own.
                 if let Plan::Delta(_) = self.plan {
@@ -500,13 +577,15 @@ impl PimdirSync {
             vanished.len()
         );
         let scope = match kind {
-            PageKind::Partial => PimdirLoadScope::Handles(
-                items
-                    .iter()
-                    .map(|item| item.handle.clone())
-                    .chain(vanished.iter().cloned())
-                    .collect(),
-            ),
+            PageKind::Partial | PageKind::DeltaHead | PageKind::BandHead => {
+                PimdirLoadScope::Handles(
+                    items
+                        .iter()
+                        .map(|item| item.handle.clone())
+                        .chain(vanished.iter().cloned())
+                        .collect(),
+                )
+            }
             PageKind::Delta | PageKind::Last => PimdirLoadScope::All,
         };
         self.page = Some(Page {
@@ -562,7 +641,9 @@ impl PimdirSync {
         let page = self.page.take().expect("a page to merge");
 
         let opening = match &mut self.plan {
-            Plan::Round(round) if page.kind != PageKind::Delta && round.open => {
+            Plan::Round(round)
+                if matches!(page.kind, PageKind::Partial | PageKind::Last) && round.open =>
+            {
                 round.open = false;
                 Some((round.scope.clone(), round.band))
             }
@@ -606,9 +687,10 @@ impl PimdirSync {
         }
 
         // NOTE: a create derives once a round's last page has landed, or
-        // from a delta while no round is open (SYNC §5).
+        // from a delta while no round is open (SYNC §5); a head's write
+        // is no exception.
         self.holds_creates = match page.kind {
-            PageKind::Partial => true,
+            PageKind::Partial | PageKind::DeltaHead | PageKind::BandHead => true,
             PageKind::Last => false,
             PageKind::Delta => self.round_open,
         };
@@ -638,7 +720,7 @@ impl PimdirSync {
             (PageKind::Partial, Plan::Round(round)) => {
                 tail.push(PimdirWriteOp::SetRoundCursor {
                     collection: self.collection.clone(),
-                    cursor: page.cursor.clone().unwrap_or_default(),
+                    cursor: Some(page.cursor.clone().unwrap_or_default()),
                     checkpoint: page.checkpoint.filter(|_| !round.band),
                 });
             }
@@ -649,6 +731,19 @@ impl PimdirSync {
                     checkpoint: page.checkpoint.filter(|_| !round.band),
                 });
             }
+            // NOTE: a delta head's checkpoint becomes the round's, the
+            // cursor staying, whether the round lists a band or not: the
+            // head listed the run's whole scope (SYNC §5).
+            (PageKind::DeltaHead, _) => {
+                if let Some(checkpoint) = page.checkpoint {
+                    tail.push(PimdirWriteOp::SetRoundCursor {
+                        collection: self.collection.clone(),
+                        cursor: None,
+                        checkpoint: Some(checkpoint),
+                    });
+                }
+            }
+            (PageKind::BandHead, _) => {}
             (_, Plan::Delta(_)) => unreachable!("a round page plans a round"),
         }
 
@@ -662,14 +757,17 @@ impl PimdirSync {
             });
         }
 
+        // NOTE: a band head stamps nothing: the round's last page lists
+        // again what its band holds, and finds absent what went (SYNC §5).
+        let stamped = !matches!(page.kind, PageKind::Delta | PageKind::BandHead);
         self.landing = Some(Landing {
-            stamp: (page.kind != PageKind::Delta)
-                .then(|| items.iter().map(|item| item.handle.clone()).collect()),
+            stamp: stamped.then(|| items.iter().map(|item| item.handle.clone()).collect()),
             tail,
             next: match page.kind {
                 PageKind::Partial => page.cursor,
-                PageKind::Delta | PageKind::Last => None,
+                PageKind::Delta | PageKind::Last | PageKind::DeltaHead | PageKind::BandHead => None,
             },
+            resume: matches!(page.kind, PageKind::DeltaHead | PageKind::BandHead),
         });
 
         let local = mem::take(&mut self.local);
@@ -677,7 +775,7 @@ impl PimdirSync {
             join: Join::new(local, items),
             vanished,
             narrowing: match page.kind {
-                PageKind::Partial => Narrowing::Page,
+                PageKind::Partial | PageKind::DeltaHead | PageKind::BandHead => Narrowing::Page,
                 PageKind::Delta | PageKind::Last => Narrowing::Delta,
             },
         });
@@ -1713,6 +1811,29 @@ impl PimdirCoroutine for PimdirSync {
                 self.coverage = loaded.coverage;
                 self.round_open = loaded.round.is_some();
                 self.plan = self.choose(loaded.round.as_ref());
+                // NOTE: a run resuming the open round lists its head first
+                // (SYNC §5); one opening a round has none to list.
+                self.head = match (&self.plan, &loaded.round) {
+                    (Plan::Round(plan), Some(round)) if !plan.open => self.head_of(round),
+                    _ => None,
+                };
+                self.enumerate()
+            }
+
+            // NOTE: a head is refused by its own answer; one refused as a
+            // cursor is read as such all the same.
+            (
+                State::Enumerating,
+                Some(PimdirArg::Enumerate(
+                    PimdirEnumerated::HeadRejected | PimdirEnumerated::CursorRejected,
+                )),
+            ) if self.head.is_some() => self.head_rejected(),
+
+            (State::Enumerating, Some(PimdirArg::Enumerate(PimdirEnumerated::NoHead)))
+                if self.head.is_some() =>
+            {
+                debug!("the connector lists no head, resume the round");
+                self.head = None;
                 self.enumerate()
             }
 
@@ -1726,10 +1847,12 @@ impl PimdirCoroutine for PimdirSync {
 
             (State::LoadingPage, Some(PimdirArg::Load(loaded))) => {
                 self.absorb_load(loaded);
-                let partial = self
-                    .page
-                    .as_ref()
-                    .is_some_and(|page| page.kind == PageKind::Partial);
+                let partial = self.page.as_ref().is_some_and(|page| {
+                    matches!(
+                        page.kind,
+                        PageKind::Partial | PageKind::DeltaHead | PageKind::BandHead
+                    )
+                });
                 let hints = self.hints();
                 if partial && !hints.is_empty() {
                     debug!("check {} listed hints against the collection", hints.len());
@@ -1783,9 +1906,17 @@ impl PimdirCoroutine for PimdirSync {
                     return self.step();
                 }
 
+                // NOTE: a head landed: the round resumes from the cursor it
+                // kept.
+                let landing = self.landing.take();
+                if landing.as_ref().is_some_and(|landing| landing.resume) {
+                    self.metas.clear();
+                    return self.enumerate();
+                }
+
                 // NOTE: a page before the last landed with its cursor; the
                 // next one resumes from it.
-                let next = self.landing.take().and_then(|landing| landing.next);
+                let next = landing.and_then(|landing| landing.next);
                 if let (Some(cursor), Plan::Round(round)) = (next, &mut self.plan) {
                     round.cursor = Some(cursor);
                     self.metas.clear();
@@ -1884,6 +2015,11 @@ enum PageKind {
     Partial,
     /// A round's last page, or its only one.
     Last,
+    /// The open round's delta head: stamped, its checkpoint the round's.
+    DeltaHead,
+    /// The open round's band head: neither stamped nor carrying a
+    /// checkpoint.
+    BandHead,
 }
 
 /// A page taken in, until its loads are answered.
@@ -1903,6 +2039,8 @@ struct Landing {
     tail: Vec<PimdirWriteOp>,
     /// Where the next page resumes, `None` once the listing ends.
     next: Option<PimdirCursor>,
+    /// Whether a head landed, the round resuming from the cursor it kept.
+    resume: bool,
 }
 
 /// How the page named a member the join writes.
@@ -3397,6 +3535,158 @@ mod tests {
             },
             "a full sync must ignore the checkpoint"
         );
+    }
+
+    /// A round left open by an earlier run, resumed from `p1`.
+    fn open_round(checkpoint: Option<&[u8]>, band: bool) -> PimdirLoaded {
+        PimdirLoaded {
+            checkpoint: Some(PimdirCheckpoint(b"source".to_vec())),
+            coverage: coverage(PimdirScope::since("2026-09-01T00:00:00Z")),
+            round: Some(PimdirRound {
+                scope: match band {
+                    true => PimdirScope {
+                        since: Some("2026-07-01T00:00:00Z".into()),
+                        until: Some("2026-09-01T00:00:00Z".into()),
+                    },
+                    false => PimdirScope::unbounded(),
+                },
+                cursor: Some(PimdirCursor(b"p1".to_vec())),
+                checkpoint: checkpoint.map(|bytes| PimdirCheckpoint(bytes.to_vec())),
+                started_at: "2026-10-13T10:00:00.000Z".into(),
+                band,
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_resumed_round_lists_its_delta_head_first() {
+        let request = listing(
+            &mut PimdirSync::new("inbox", PimdirSyncOptions::default()).heads(PimdirHeads::BOTH),
+            open_round(Some(b"round"), false),
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Head(PimdirHead::Delta(PimdirCheckpoint(b"round".to_vec()))),
+            "a delta head from the round's checkpoint, whatever the source's"
+        );
+    }
+
+    #[test]
+    fn a_round_holding_no_position_lists_a_band_head() {
+        let request = listing(
+            &mut PimdirSync::new("inbox", PimdirSyncOptions::default()).heads(PimdirHeads::BOTH),
+            open_round(None, false),
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Head(PimdirHead::Band {
+                since: "2026-10-13T10:00:00.000Z".into()
+            }),
+            "no delta head from the source's checkpoint outside a band round"
+        );
+    }
+
+    #[test]
+    fn a_band_round_lists_its_head_from_the_source_checkpoint_over_the_run_scope() {
+        let mut sync = PimdirSync::new("inbox", scoped("2026-07-01T00:00:00Z"))
+            .scope_bound(false)
+            .heads(PimdirHeads::DELTA);
+        let request = listing(&mut sync, open_round(None, true));
+        assert_eq!(
+            request.listing,
+            PimdirListing::Head(PimdirHead::Delta(PimdirCheckpoint(b"source".to_vec())))
+        );
+        assert_eq!(
+            request.scope,
+            PimdirScope::since("2026-07-01T00:00:00Z"),
+            "checked against the run's scope, not the band"
+        );
+    }
+
+    #[test]
+    fn a_connector_listing_no_head_resumes_the_round() {
+        let request = listing(
+            &mut PimdirSync::new("inbox", PimdirSyncOptions::default()),
+            open_round(Some(b"round"), false),
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Round {
+                cursor: Some(PimdirCursor(b"p1".to_vec())),
+                band: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_delta_only_connector_lists_no_head_without_a_position() {
+        let request = listing(
+            &mut PimdirSync::new("inbox", PimdirSyncOptions::default()).heads(PimdirHeads::DELTA),
+            open_round(None, false),
+        );
+        assert!(request.head().is_none(), "{request:?}");
+    }
+
+    #[test]
+    fn a_run_opening_a_round_lists_no_head() {
+        let opts = PimdirSyncOptions {
+            full: true,
+            ..Default::default()
+        };
+        let request = listing(
+            &mut PimdirSync::new("inbox", opts).heads(PimdirHeads::BOTH),
+            open_round(Some(b"round"), false),
+        );
+        assert_eq!(
+            request.listing,
+            PimdirListing::Round {
+                cursor: None,
+                band: false
+            }
+        );
+    }
+
+    #[test]
+    fn no_head_answered_resumes_the_round_from_its_cursor() {
+        let mut sync =
+            PimdirSync::new("inbox", PimdirSyncOptions::default()).heads(PimdirHeads::DELTA);
+        let head = listing(&mut sync, open_round(Some(b"round"), false));
+        assert!(head.head().is_some());
+        match sync.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::NoHead))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { request, .. }) => {
+                assert_eq!(
+                    request.listing,
+                    PimdirListing::Round {
+                        cursor: Some(PimdirCursor(b"p1".to_vec())),
+                        band: false
+                    }
+                )
+            }
+            state => panic!("expected the round's next page, got {state:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rejected_head_restarts_the_round_over_the_run_scope() {
+        let mut sync = PimdirSync::new("inbox", scoped("2026-07-01T00:00:00Z"))
+            .scope_bound(false)
+            .heads(PimdirHeads::DELTA);
+        let _ = listing(&mut sync, open_round(None, true));
+        match sync.resume(Some(PimdirArg::Enumerate(PimdirEnumerated::HeadRejected))) {
+            PimdirCoroutineState::Yielded(PimdirYield::WantsEnumerate { request, .. }) => {
+                assert_eq!(
+                    request.listing,
+                    PimdirListing::Round {
+                        cursor: None,
+                        band: false
+                    },
+                    "a round from its first page, never a band"
+                );
+                assert_eq!(request.scope, PimdirScope::since("2026-07-01T00:00:00Z"));
+            }
+            state => panic!("expected a restarted round, got {state:?}"),
+        }
     }
 
     #[test]

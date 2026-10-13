@@ -320,12 +320,15 @@ pub enum PimdirWriteOp {
         handles: Vec<PimdirHandle>,
     },
     /// Land a page's resume cursor, and the checkpoint it carried when it
-    /// carried one, the round staying open (SYNC §5).
+    /// carried one, the round staying open (SYNC §5). A delta head lands
+    /// its checkpoint with no cursor, keeping the one a page landed: a
+    /// head never moves the round's cursor.
     SetRoundCursor {
         /// The collection the round lists.
         collection: PimdirCollectionId,
-        /// Where the next page resumes.
-        cursor: PimdirCursor,
+        /// Where the next page resumes, `None` keeping the one an earlier
+        /// page landed.
+        cursor: Option<PimdirCursor>,
         /// The checkpoint the page carried, `None` keeping an earlier one.
         checkpoint: Option<PimdirCheckpoint>,
     },

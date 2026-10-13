@@ -342,3 +342,13 @@ The deletes a round infers SHALL be the based bindings of its source no page of 
 
 ### Requirement: A scope bounds mail only
 `PimdirSyncOptions::scope` is unbounded by default. `PimdirSourceStore::sync` and `prepare_sync` SHALL refuse a bounded scope on a collection whose kind is not `message/rfc822`, naming the kind (`PimdirError::Scope`).
+
+### Requirement: A resumed round lists its head first
+A run resuming an open round SHALL first ask for the round's head when the connector lists heads (`PimdirRemote::heads`, `PimdirSync::heads`). The head is a delta head from the round's checkpoint, or for a band round from the source's checkpoint, when the connector lists delta heads; else a band head from `round_started_at`, when it lists band heads; else none. It is checked against the run's scope and merged as a page before the last.
+
+A delta head stamps its members and records its checkpoint as the round's (`SetRoundCursor` with no cursor). A band head stamps nothing and records nothing, the round's last page listing its band again. Neither derives an `Add`, infers an absence or moves the cursor. `HeadRejected` restarts the round over the run's scope, never a band, and `NoHead` resumes the round (pimdir SYNC §5, vectors/sync/62 to 69).
+
+#### Scenario: An arrival during an open round
+- GIVEN a round left open on checkpoint h1000 and cursor t1
+- WHEN the next run's head lists a new member with checkpoint h1001, and the last page lands
+- THEN the member is named and stamped, it survives the close, and the round closes on h1001

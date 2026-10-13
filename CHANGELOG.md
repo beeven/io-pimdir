@@ -6,7 +6,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- Added round heads (pimdir draft-04, SYNC §4, §5). A run resuming an open round first asks for the round's head, so a message arriving during a long round shows at the next run rather than once the round has closed.
+  - The connector side: `PimdirRemote::heads` (default none), `PimdirHeads`, `PimdirHead` (`Delta` from a checkpoint, `Band` from the instant the round opened), `PimdirListing::Head`, `PimdirEnumerate::head`, `PimdirEnumerated::HeadRejected` and `NoHead`, and `PimdirRemoteSnapshot::band_head`; `PimdirSync::heads` for a runner of its own, which `PimdirSourceStore::sync` sets from the remote.
+  - A delta head stamps its members and records its checkpoint as the round's. A band head stamps nothing and records nothing, and a connector listing band heads lists the band again in every round's last page.
+  - A rejected head position restarts the round over the run's scope.
+
 - Added `summary::mail::MIME_DEPTH_MAX` (64), the deepest multipart level the walk of a message's parts opens.
+
+### Changed
+
+- Changed `PimdirWriteOp::SetRoundCursor::cursor` to an `Option<PimdirCursor>`, `None` keeping the cursor a page landed, and the vendored `set_round_cursor` to coalesce it (pimdir draft-04, STORAGE §10). Added `PimdirListing::Head` and two `PimdirEnumerated` variants, which an exhaustive match must now handle. **Breaking.**
 
 ### Fixed
 

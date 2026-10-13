@@ -20,9 +20,9 @@ use io_pimdir::{
     object::{PimdirHash, PimdirObject},
     placement::{PimdirFlags, PimdirHandle, PimdirLinkId},
     remote::{
-        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome,
-        PimdirPushResult, PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot,
-        PimdirTier,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirHead,
+        PimdirHeads, PimdirPushOutcome, PimdirPushResult, PimdirRemote, PimdirRemoteItem,
+        PimdirRemoteMeta, PimdirRemoteSnapshot, PimdirTier,
     },
     sql,
     summary::{
@@ -282,6 +282,10 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 .unwrap_or(false)
                 .then_some("2026-10-07T00:00:00.000Z")
         };
+        // NOTE: a case states the instant a band head reads (SYNC §11).
+        let started = source["round_started_at"]
+            .as_str()
+            .or(instant(&source["round_open"]));
         conn.execute(
             "UPDATE sources SET round = ?1, round_since = ?2, round_until = ?3, round_cursor = ?4,
                 round_checkpoint = ?5, round_started_at = ?6, covered_since = ?7,
@@ -293,7 +297,7 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
                 source["round_until"].as_str(),
                 source["round_cursor"].as_str().map(str::as_bytes),
                 source["round_checkpoint"].as_str().map(str::as_bytes),
-                instant(&source["round_open"]),
+                started,
                 source["covered_since"].as_str(),
                 source["covered_until"].as_str(),
                 instant(&source["covered"]),
@@ -326,6 +330,10 @@ struct Scripted {
     cursor_rejected: bool,
     /// Whether the checkpoint is bound to the scope it was made under.
     scope_bound: bool,
+    /// The heads the connector lists (SYNC §4).
+    heads: PimdirHeads,
+    /// The case's answer to the run's head, until the engine asks for it.
+    head: Option<Value>,
     fetch: Map<String, Value>,
     outcomes: Vec<Value>,
     pushes: Vec<Value>,
@@ -461,6 +469,37 @@ impl PimdirRemote for Scripted {
         _: &PimdirCollectionId,
         request: PimdirEnumerate,
     ) -> Result<PimdirEnumerated, String> {
+        // NOTE: a head is asked for from the position or the instant the
+        // case names, and is no page `interrupted_after` counts.
+        if let Some(asked) = request.head() {
+            let Some(head) = self.head.take() else {
+                return Ok(PimdirEnumerated::NoHead);
+            };
+            match asked {
+                PimdirHead::Delta(checkpoint) => {
+                    assert_eq!(head["kind"], "delta", "a delta head was asked for");
+                    assert_eq!(
+                        head["from"].as_str().map(str::as_bytes),
+                        Some(checkpoint.0.as_slice()),
+                        "the delta head's position"
+                    );
+                }
+                PimdirHead::Band { since } => {
+                    assert_eq!(head["kind"], "band", "a band head was asked for");
+                    assert_eq!(
+                        head["since"].as_str(),
+                        Some(since.as_str()),
+                        "the band head's instant"
+                    );
+                }
+            }
+            if head["rejected"].as_bool() == Some(true) {
+                return Ok(PimdirEnumerated::HeadRejected);
+            }
+            let mut page = Self::page(&self.spec, &self.kind, &head);
+            page.complete = false;
+            return Ok(PimdirEnumerated::Page(page));
+        }
         if request.cursor().is_some() && self.cursor_rejected {
             self.cursor_rejected = false;
             return Ok(PimdirEnumerated::CursorRejected);
@@ -480,6 +519,10 @@ impl PimdirRemote for Scripted {
 
     fn scope_bound(&self) -> bool {
         self.scope_bound
+    }
+
+    fn heads(&self) -> PimdirHeads {
+        self.heads
     }
 
     fn fetch(
@@ -669,7 +712,8 @@ fn run(
             // is read all the same (SYNC §5).
             let mut sync = store
                 .prepare_sync(collection, options(&run["options"]), remote.scope_bound())
-                .unwrap();
+                .unwrap()
+                .heads(remote.heads());
             let mut arg = None;
             let report = loop {
                 let yielded = match sync.resume(arg.take()) {
@@ -1016,6 +1060,21 @@ fn every_sync_vector_reproduces() {
             served: 0,
             cursor_rejected: remote_spec["cursor_rejected"].as_bool().unwrap_or(false),
             scope_bound: remote_spec["scope_bound"].as_bool().unwrap_or(true),
+            heads: remote_spec["heads"].as_array().into_iter().flatten().fold(
+                PimdirHeads::NONE,
+                |heads, kind| match kind.as_str() {
+                    Some("delta") => PimdirHeads {
+                        delta: true,
+                        ..heads
+                    },
+                    Some("band") => PimdirHeads {
+                        band: true,
+                        ..heads
+                    },
+                    other => panic!("unknown head kind {other:?}"),
+                },
+            ),
+            head: remote_spec.get("head").cloned(),
             fetch: case["remote"]["fetch"]
                 .as_object()
                 .cloned()
@@ -1032,6 +1091,10 @@ fn every_sync_vector_reproduces() {
             .for_source(run_spec["source"].as_str().unwrap());
         let (pushes, events) = run(&mut store, &case, &mut remote);
         drop(store);
+        assert!(
+            remote.head.is_none(),
+            "{label}: the run listed no head, the case scripts one"
+        );
 
         let expected_pushes = case["expect"]["pushes"]
             .as_array()

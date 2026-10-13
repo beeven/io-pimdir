@@ -17,9 +17,9 @@ use io_pimdir::{
     mutate::PimdirMutation,
     placement::{PimdirFlags, PimdirHandle, PimdirLevel},
     remote::{
-        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirPushOutcome,
-        PimdirPushResult, PimdirRemote, PimdirRemoteItem, PimdirRemoteMeta, PimdirRemoteSnapshot,
-        PimdirTier,
+        PimdirEnumerate, PimdirEnumerated, PimdirFetchedBody, PimdirFetchedItem, PimdirHead,
+        PimdirHeads, PimdirPushOutcome, PimdirPushResult, PimdirRemote, PimdirRemoteItem,
+        PimdirRemoteMeta, PimdirRemoteSnapshot, PimdirTier,
     },
     summary::mail,
     sync::PimdirSyncOptions,
@@ -51,6 +51,7 @@ struct Paged {
     pages: Vec<PimdirEnumerated>,
     requests: Vec<PimdirEnumerate>,
     bound: bool,
+    heads: PimdirHeads,
 }
 
 impl PimdirRemote for Paged {
@@ -95,6 +96,10 @@ impl PimdirRemote for Paged {
 
     fn scope_bound(&self) -> bool {
         self.bound
+    }
+
+    fn heads(&self) -> PimdirHeads {
+        self.heads
     }
 }
 
@@ -165,6 +170,84 @@ fn an_interrupted_round_resumes_and_closes_with_its_coverage() {
     let coverage = collections[0].coverage.as_ref().expect("a coverage");
     assert_eq!(coverage.scope, PimdirScope::since("2026-09-01T00:00:00Z"));
     assert!(reader.list_coverage("INBOX").unwrap()[0].round.is_none());
+}
+
+/// A message arriving while a round is open shows at the next run, which
+/// lists the round's head before resuming it: the round keeps it when it
+/// closes, on the head's checkpoint (SYNC §5).
+#[test]
+fn an_arrival_during_a_round_is_listed_by_its_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("gmail");
+    store.ensure_collection("INBOX", "message/rfc822").unwrap();
+    let recent = message(
+        "a@x",
+        "Recent",
+        "Mon, 5 Oct 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let older = message(
+        "b@x",
+        "Older",
+        "Tue, 1 Sep 2026 10:00:00 +0000",
+        "text/plain",
+    );
+    let invoice = message(
+        "c@x",
+        "Facture",
+        "Tue, 13 Oct 2026 10:03:00 +0000",
+        "text/plain",
+    );
+
+    let mut remote = Paged {
+        pages: vec![page(vec![member("2", &[], &recent)], Some("p1"))],
+        heads: PimdirHeads::DELTA,
+        ..Default::default()
+    };
+    let opts = PimdirSyncOptions::default();
+    assert!(store.sync("INBOX", opts.clone(), &mut remote).is_err());
+
+    remote.pages = vec![
+        PimdirEnumerated::Page(PimdirRemoteSnapshot::delta(
+            vec![member("3", &[], &invoice)],
+            Vec::new(),
+            PimdirCheckpoint(b"c2".to_vec()),
+        )),
+        PimdirEnumerated::Page(PimdirRemoteSnapshot::page(
+            vec![member("1", &[], &older)],
+            None,
+            None,
+        )),
+    ];
+    store.sync("INBOX", opts.clone(), &mut remote).unwrap();
+    assert_eq!(
+        remote.requests[2].head(),
+        Some(&PimdirHead::Delta(PimdirCheckpoint(b"c1".to_vec()))),
+        "the head lists from the checkpoint the round's first page carried",
+    );
+    assert_eq!(
+        remote.requests[3].cursor(),
+        Some(&PimdirCursor(b"p1".to_vec())),
+        "the round resumes from the cursor the head kept",
+    );
+    let reader = PimdirReader::open(dir.path()).unwrap();
+    assert_eq!(
+        reader.count_items("INBOX").unwrap(),
+        3,
+        "the arrival stayed"
+    );
+
+    remote.pages = vec![PimdirEnumerated::Page(PimdirRemoteSnapshot::delta(
+        Vec::new(),
+        Vec::new(),
+        PimdirCheckpoint(b"c3".to_vec()),
+    ))];
+    store.sync("INBOX", opts, &mut remote).unwrap();
+    assert_eq!(
+        remote.requests[4].checkpoint(),
+        Some(&PimdirCheckpoint(b"c2".to_vec())),
+        "the round closed on the head's checkpoint",
+    );
 }
 
 /// A collection's coverage is the narrowest of its sources', and none

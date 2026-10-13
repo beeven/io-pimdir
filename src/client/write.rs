@@ -260,7 +260,7 @@ pub(crate) fn apply(
                     named_params! {
                         ":collection": collection.0,
                         ":source": source.0,
-                        ":cursor": cursor.0,
+                        ":cursor": cursor.map(|cursor| cursor.0),
                         ":checkpoint": checkpoint.map(|checkpoint| checkpoint.0),
                     },
                 )?;

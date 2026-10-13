@@ -10,6 +10,12 @@
 //! [`PimdirRemoteSnapshot`] whose every member arrives named by its
 //! [`PimdirRemoteMeta`], or by [`PimdirEnumerated::CursorRejected`] when
 //! the source refuses the cursor a resumed round handed it.
+//!
+//! While a round is open, a run resuming it first asks for the round's
+//! head ([`PimdirListing::Head`], SYNC §4, §5): what changed since the
+//! round began, so what arrives during a long round shows before it
+//! closes. A connector states which heads it lists
+//! ([`PimdirRemote::heads`]); one listing none is never asked for one.
 
 use alloc::{string::String, vec::Vec};
 
@@ -176,6 +182,111 @@ impl PimdirRemoteSnapshot {
             checkpoint: Some(checkpoint),
         }
     }
+
+    /// A band head (SYNC §4): the members dated from the head's instant,
+    /// with no removal and no checkpoint. A delta head is answered as a
+    /// [`delta`](Self::delta).
+    pub fn band_head(items: Vec<PimdirRemoteItem>) -> Self {
+        Self {
+            items,
+            vanished: Vec::new(),
+            complete: false,
+            last: true,
+            cursor: None,
+            checkpoint: None,
+        }
+    }
+}
+
+/// The heads a connector lists while a round is open (SYNC §4).
+///
+/// A connector states it as it states
+/// [`scope_bound`](PimdirRemote::scope_bound), from what the source
+/// offers: IMAP lists delta heads with QRESYNC and band heads without
+/// it, Gmail and JMAP delta heads, Graph band heads, a connector that
+/// cannot list one before its round closes none.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirHeads {
+    /// Lists a delta head: what changed since a checkpoint
+    /// ([`PimdirHead::Delta`]).
+    pub delta: bool,
+    /// Lists a band head: every member the source dates from an instant
+    /// ([`PimdirHead::Band`]).
+    pub band: bool,
+}
+
+impl PimdirHeads {
+    /// No head: the round resumes as it would without (the default).
+    pub const NONE: Self = Self {
+        delta: false,
+        band: false,
+    };
+
+    /// Delta heads only.
+    pub const DELTA: Self = Self {
+        delta: true,
+        band: false,
+    };
+
+    /// Band heads only.
+    pub const BAND: Self = Self {
+        delta: false,
+        band: true,
+    };
+
+    /// Both: a delta head whenever the run holds a checkpoint to list
+    /// from, else a band head.
+    pub const BOTH: Self = Self {
+        delta: true,
+        band: true,
+    };
+}
+
+/// The head a run asks for while a round is open (SYNC §4, §5).
+///
+/// Answered by one page ([`PimdirEnumerated::Page`]) whose `complete`,
+/// `last` and `cursor` the engine ignores, a head never moving the
+/// round's cursor; or by [`PimdirEnumerated::HeadRejected`] or
+/// [`PimdirEnumerated::NoHead`]. The page is checked against the
+/// request's scope, which is the run's own and not the band a band
+/// round lists: the connector drops what its own check on the `Date`
+/// puts out of it, a stated removal excepted, as for a delta.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PimdirHead {
+    /// What changed since this checkpoint, as a delta answers it: the
+    /// members added or changed, each with its flags and meta, the
+    /// handles the source states removed, and the checkpoint the source
+    /// holds now, which the page MUST carry (IMAP: a QRESYNC `SELECT`
+    /// with `CHANGEDSINCE`; Gmail: the history since the history id;
+    /// JMAP: `Email/changes`; DAV: `sync-collection`). The engine stamps
+    /// the members with the round's id and the round closes on that
+    /// checkpoint, unless a later page carries a newer one.
+    ///
+    /// The checkpoint is the round's, or for a band round, which carries
+    /// none of its own, the source's. A connector listing delta heads
+    /// MUST read every later page's members anew, leaving out what the
+    /// source no longer holds in the collection, so a page never lists a
+    /// member as it stood before a removal a head stated.
+    Delta(PimdirCheckpoint),
+    /// Every member the source dates at or after `since` less a margin
+    /// of two days, by an instant it keeps for each member that never
+    /// moves back: the last time the member changed where the source
+    /// states it and can filter on it, else when it arrived (Graph's
+    /// `receivedDateTime`, IMAP's `INTERNALDATE` through `SEARCH SINCE`).
+    /// The page carries no checkpoint and no vanished handle, a listing
+    /// by date stating no removal, and the engine stamps none of its
+    /// members.
+    ///
+    /// A connector listing band heads MUST list again, in the last page
+    /// of every round, every member a band head of that round would list
+    /// then, read no earlier than the checkpoint that page carries: that
+    /// page is what keeps a band head's members when the round closes,
+    /// whatever is gone being found absent.
+    Band {
+        /// The instant the round opened, RFC 3339 as the store stamped
+        /// it (`round_started_at`).
+        since: String,
+    },
 }
 
 /// What a connector is asked to list (SYNC §5).
@@ -195,12 +306,15 @@ pub enum PimdirListing {
         /// hands none, and the engine ignores any it does.
         band: bool,
     },
+    /// The head of the open round, listed before the round resumes
+    /// (SYNC §5).
+    Head(PimdirHead),
 }
 
 /// One enumeration request: the listing and the scope it lists (SYNC §4).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PimdirEnumerate {
-    /// A delta or a round.
+    /// A delta, a round or a head.
     pub listing: PimdirListing,
     /// The scope: a round lists it, a delta is checked against it. A
     /// connector MAY narrow its listing by the provider's received-date
@@ -215,7 +329,15 @@ impl PimdirEnumerate {
     pub fn checkpoint(&self) -> Option<&PimdirCheckpoint> {
         match &self.listing {
             PimdirListing::Delta(checkpoint) => Some(checkpoint),
-            PimdirListing::Round { .. } => None,
+            PimdirListing::Round { .. } | PimdirListing::Head(_) => None,
+        }
+    }
+
+    /// The head asked for, `None` for a delta or a round.
+    pub fn head(&self) -> Option<&PimdirHead> {
+        match &self.listing {
+            PimdirListing::Head(head) => Some(head),
+            PimdirListing::Delta(_) | PimdirListing::Round { .. } => None,
         }
     }
 
@@ -223,7 +345,7 @@ impl PimdirEnumerate {
     pub fn cursor(&self) -> Option<&PimdirCursor> {
         match &self.listing {
             PimdirListing::Round { cursor, .. } => cursor.as_ref(),
-            PimdirListing::Delta(_) => None,
+            PimdirListing::Delta(_) | PimdirListing::Head(_) => None,
         }
     }
 }
@@ -237,6 +359,18 @@ pub enum PimdirEnumerated {
     /// a Gmail page token): the round restarts under a new id rather than
     /// the connector answering from the beginning as if it resumed.
     CursorRejected,
+    /// The source refused the position a head was asked from (an expired
+    /// Gmail history id, a JMAP state it can no longer calculate changes
+    /// from, a DAV sync token refused as invalid): the checkpoint the
+    /// round would close with is void, so the round restarts over the
+    /// run's scope, never a band (SYNC §5). A moved handle space (an
+    /// IMAP `UIDVALIDITY` bump) is a failure naming a rekey, as for a
+    /// delta.
+    HeadRejected,
+    /// The connector cannot list the head it was asked for (an IMAP
+    /// server without QRESYNC asked for a delta head): the round resumes
+    /// as it would without.
+    NoHead,
 }
 
 impl From<PimdirRemoteSnapshot> for PimdirEnumerated {
@@ -365,5 +499,15 @@ pub trait PimdirRemote {
     /// always relists the whole wider scope.
     fn scope_bound(&self) -> bool {
         true
+    }
+
+    /// The heads this connector lists while a round is open (SYNC §4),
+    /// none by default: such a connector is never asked for one, and an
+    /// arrival during a round shows once the round has closed.
+    ///
+    /// A connector listing band heads takes on the last page's
+    /// obligation [`PimdirHead::Band`] states.
+    fn heads(&self) -> PimdirHeads {
+        PimdirHeads::NONE
     }
 }

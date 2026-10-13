@@ -210,7 +210,8 @@ impl PimdirSourceStore {
     /// the rights refuse is then held rather than reverted, a revert
     /// reading as a resurrection beside another source. Whether the
     /// remote's checkpoint is bound to a scope is the remote's own
-    /// [`PimdirRemote::scope_bound`]. A bounded scope on a collection of
+    /// [`PimdirRemote::scope_bound`], and the heads it lists while a round
+    /// is open its own [`PimdirRemote::heads`]. A bounded scope on a collection of
     /// another kind than mail is refused, naming the kind
     /// ([`PimdirError::Scope`]).
     ///
@@ -223,14 +224,18 @@ impl PimdirSourceStore {
         opts: PimdirSyncOptions,
         remote: &mut R,
     ) -> Result<PimdirSyncReport, PimdirRunError<R::Error, PimdirArgError>> {
-        let coroutine = self.prepare_sync(collection, opts, remote.scope_bound())?;
+        let coroutine = self
+            .prepare_sync(collection, opts, remote.scope_bound())?
+            .heads(remote.heads());
         self.run(coroutine, remote)
     }
 
     /// The sync coroutine [`sync`](Self::sync) runs, for a runner of its
     /// own: the scope checked against the collection's kind, and the
     /// coroutine told whether other sources bind the collection and
-    /// whether the remote's checkpoint is bound to a scope.
+    /// whether the remote's checkpoint is bound to a scope. A runner of
+    /// its own tells it the heads its remote lists with
+    /// [`PimdirSync::heads`], none otherwise.
     pub fn prepare_sync(
         &self,
         collection: impl Into<PimdirCollectionId>,
