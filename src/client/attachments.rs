@@ -17,7 +17,10 @@
 //! streaming the body never holds it whole to derive them. A placement
 //! gaining a body the account already holds takes them from a row
 //! holding it (`held_mail_summary`), its size the body's, never the
-//! guess its listing made.
+//! guess its listing made. A held body no such row states a mark of
+//! (rows written before marks were read off bodies) is walked for those
+//! two columns alone: its parts stand for nothing, its rows are left as
+//! they are.
 
 use alloc::{format, string::String, vec::Vec};
 
@@ -69,7 +72,8 @@ pub(crate) struct Entering {
 /// enters: it is walked, its mark and invitation stated, and its parts
 /// answered for [`record`] unless its key is writer-derived, which names
 /// no identity (§14.3). A body a row of the account already holds is
-/// linked: its size, mark and invitation are that row's. `None` for a
+/// linked: its size, mark and invitation are that row's, a body no such
+/// row states a mark of walked for those two alone. `None` for a
 /// collection of another kind, or when nothing enters.
 pub(crate) fn gaining(
     conn: &Connection,
@@ -125,7 +129,16 @@ pub(crate) fn gaining(
     let mut entering = Vec::new();
     for (link, hash) in bodies {
         let found = match held.get(&(link.0.clone(), hash.0.clone())) {
-            Some(size) => Body::Held(held_columns(conn, &link, &hash, account.as_deref())?, *size),
+            Some(size) => {
+                let (mark, invitation) = held_columns(conn, &link, &hash, account.as_deref())?;
+                Body::Held(
+                    match mark {
+                        Some(_) => (mark, invitation),
+                        None => walked_columns(blobs, &link, &hash, collection, invitation)?,
+                    },
+                    *size,
+                )
+            }
             None => match walk(blobs, &hash)? {
                 Some(parts) => Body::Read(parts),
                 None => {
@@ -181,8 +194,8 @@ pub(crate) fn gaining(
 
 /// What a body gaining a row gives it.
 enum Body {
-    /// Held by a row of the account: that row's mark and invitation, and
-    /// the body's size.
+    /// Held by a row of the account: that row's mark and invitation, a
+    /// walk's when it states no mark, and the body's size.
     Held((Option<bool>, Option<String>), i64),
     /// Read now, entering the store.
     Read(PimdirParts),
@@ -213,6 +226,33 @@ fn held_columns(
         )
         .optional()?
         .unwrap_or_default())
+}
+
+/// The mark and invitation a walk of a held body gives, for a body no
+/// row holding it states a mark of (rows written before marks were read
+/// off bodies): those two columns only, its parts standing for nothing,
+/// since a body held before is never walked for stand-ins (§14.3), and
+/// the held rows left as they are. `(None, held)` when the blob store
+/// lacks the body, the writer's mark then kept.
+fn walked_columns(
+    blobs: &PimdirBlobs,
+    link: &PimdirLinkId,
+    hash: &PimdirHash,
+    collection: &str,
+    held: Option<String>,
+) -> Result<(Option<bool>, Option<String>), PimdirError> {
+    match walk(blobs, hash)? {
+        Some(parts) => Ok((Some(parts.attachment), parts.invitation.or(held))),
+        None => {
+            log::warn!(
+                "body {} of {} in {collection} is held by rows stating no mark \
+                 and is not in the blob store, the writer's mark kept",
+                hash.0,
+                link.0,
+            );
+            Ok((None, held))
+        }
+    }
 }
 
 /// Records the stand-ins of the bodies entering, once the diff that

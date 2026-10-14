@@ -568,6 +568,63 @@ fn a_copy_of_a_held_body_takes_the_columns_its_body_gave() {
     assert_eq!(collection_rows(&store), before, "a copy enters nothing");
 }
 
+#[test]
+fn a_copy_of_a_body_held_with_no_mark_takes_the_columns_a_walk_gives() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    stored(&mut store, "INBOX", "1", LINK, BODY);
+    stored(&mut store, "INBOX", "2", INVITE_LINK, INVITE);
+
+    // NOTE: the rows an older writer left, which read neither column off
+    // the body and recorded no stand-in.
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch(
+        "UPDATE mail_summary SET attachment = NULL, invitation = NULL;
+         DELETE FROM item_reference WHERE role = 'attachment';",
+    )
+    .unwrap();
+    drop(conn);
+    assert!(stand_ins(&store, LINK).is_empty());
+    let before = collection_rows(&store);
+    let held = |store: &mut PimdirSourceStore| {
+        [LINK, INVITE_LINK].map(|link| columns(store, "INBOX", link))
+    };
+    let old = held(&mut store);
+    assert_eq!(
+        old,
+        [
+            (Some(BODY.len() as u64), None, None),
+            (Some(INVITE.len() as u64), None, None),
+        ]
+    );
+
+    // NOTE: the listing guessed the opposite mark for each.
+    for (handle, link, body) in [("8", LINK, BODY), ("9", INVITE_LINK, INVITE)] {
+        let mut copy = listed("Archive", handle, link, body, None);
+        if let Some(PimdirSummary::Mail(mail)) = &mut copy.summary {
+            mail.attachment = Some(link == INVITE_LINK);
+        }
+        copy.object = Some(hash_of(body));
+        copy.level = PimdirLevel::Full;
+        copy.base.as_mut().unwrap().object = Some(hash_of(body));
+        store
+            .write(vec![PimdirWriteOp::UpsertPlacement(copy)])
+            .unwrap();
+    }
+
+    assert_eq!(
+        columns(&mut store, "Archive", LINK),
+        (Some(BODY.len() as u64), Some(true), None)
+    );
+    assert_eq!(
+        columns(&mut store, "Archive", INVITE_LINK),
+        (Some(INVITE.len() as u64), Some(false), Some(UID.into()))
+    );
+    assert!(stand_ins(&store, LINK).is_empty(), "no stand-in recorded");
+    assert_eq!(collection_rows(&store), before);
+    assert_eq!(held(&mut store), old, "the held rows are left as they are");
+}
+
 /// A remote an upgrade linking from the store never reaches.
 struct Unreached;
 

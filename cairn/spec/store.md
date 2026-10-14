@@ -996,10 +996,13 @@ A write SHALL record, in its transaction, the stand-ins of every `message/rfc822
 - tests/attachments.rs; sync vector 70 in tests/vectors_sync.rs.
 
 ### Requirement: A body gaining a row states the columns only the body gives
-A write SHALL state, on the mail row of every live, stored item gaining a body (pimdir STORAGE Annex A.1), the columns only the body gives, over whatever the writer read without it. A body entering the store (no row of its key in the account held it before the write, `lookup_objects`) SHALL be walked once (`summary::mail::attachments::PimdirAttachmentWalk`), its mark stated and its invitation stated when it gives one, the same walk answering its stand-ins; a writer-derived key's body is walked for these too and stands for nothing. A body the account already holds SHALL be linked: the row's size is the object's, and its mark and invitation those a row holding that body states (`held_mail_summary`), the writer's kept where no such row states one.
+A write SHALL state, on the mail row of every live, stored item gaining a body (pimdir STORAGE Annex A.1), the columns only the body gives, over whatever the writer read without it. A body entering the store (no row of its key in the account held it before the write, `lookup_objects`) SHALL be walked once (`summary::mail::attachments::PimdirAttachmentWalk`), its mark stated and its invitation stated when it gives one, the same walk answering its stand-ins; a writer-derived key's body is walked for these too and stands for nothing. A body the account already holds SHALL be linked: the row's size is the object's, and its mark and invitation those a row holding that body states (`held_mail_summary`). A body no such row states a mark of (rows written before marks were read off bodies) SHALL be walked from its blob for the mark and the invitation of the new row alone: no stand-in recorded (§14.3) and the held rows left as they are, the writer's mark kept when the blob store lacks the body.
 
 #### Scenario: A streamed body
 - tests/attachments.rs `a_body_read_without_it_states_what_its_parts_give`: the header block's guess (an attachment, no invitation) written with the body reads as the body gives (none, the `UID`).
 
 #### Scenario: A copy of a held body
 - tests/attachments.rs `a_copy_of_a_held_body_takes_the_columns_its_body_gave`: a placement written with a held hash and its listing's summary takes the held row's mark and invitation and the body's size, and records no stand-in.
+
+#### Scenario: A copy of a body held with no mark
+- tests/attachments.rs `a_copy_of_a_body_held_with_no_mark_takes_the_columns_a_walk_gives`: held rows stating neither column and no stand-in, as an older writer left them; a copy guessing the opposite mark takes the walk's mark and invitation, records no stand-in, and the held rows still state neither.
