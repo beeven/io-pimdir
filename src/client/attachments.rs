@@ -1,4 +1,4 @@
-//! # Stand-ins, recorded as a body enters
+//! # A body entering the store, or linked from it
 //!
 //! A message's attachments are files holding no body, one per part
 //! carrying `Content-Disposition: attachment`, each referenced by the
@@ -10,10 +10,18 @@
 //! nothing, so neither does a body held before the rule ran: nothing is
 //! walked twice, nothing is backfilled, and a stand-in once recorded is
 //! never recomputed.
+//!
+//! The same walk gives the columns of the row that only the body gives
+//! (Annex A.1), the attachment mark and the invitation, which the write
+//! states over whatever the writer read without the body: a writer
+//! streaming the body never holds it whole to derive them. A placement
+//! gaining a body the account already holds takes them from a row
+//! holding it (`held_mail_summary`), its size the body's, never the
+//! guess its listing made.
 
 use alloc::{format, string::String, vec::Vec};
 
-use std::{collections::BTreeSet, io::Read};
+use std::{collections::BTreeMap, io::Read};
 
 use rusqlite::{Connection, OptionalExtension, named_params};
 
@@ -24,8 +32,9 @@ use crate::{
     placement::PimdirLinkId,
     sql,
     summary::{
+        PimdirSummary,
         file::{self, PimdirFileSummary},
-        mail::attachments::PimdirAttachmentWalk,
+        mail::attachments::{PimdirAttachmentWalk, PimdirParts},
     },
 };
 
@@ -44,26 +53,32 @@ pub(crate) const NAME: &str = "attachments";
 /// How much of a body one read takes.
 const CHUNK: usize = 64 * 1024;
 
-/// The bodies a batch brings into one mail collection, read before its
-/// diff is saved.
+/// The stand-ins the bodies entering one mail collection stand for,
+/// walked before its diff is saved and recorded after it.
 pub(crate) struct Entering {
     collection: String,
     account: Option<String>,
-    bodies: Vec<(PimdirLinkId, PimdirHash)>,
+    bodies: Vec<(PimdirLinkId, Vec<PimdirFileSummary>)>,
 }
 
-/// The bodies the diff of `collection` from `old` to `new` brings into
-/// the store: a live, stored item under a key naming an identity gaining
-/// a body no row of that key in the account held before the batch.
+/// Reads the bodies the diff of `collection` from `old` to `new` gives a
+/// live, stored item under a key naming an identity, and states in
+/// `new` the columns of their rows only a body gives (Annex A.1).
 ///
-/// `None` for a collection of another kind, or when nothing enters.
-pub(crate) fn entering(
+/// A body no row of its key in the account held before the batch
+/// enters: it is walked, its mark and invitation stated, and its parts
+/// answered for [`record`] unless its key is writer-derived, which names
+/// no identity (§14.3). A body a row of the account already holds is
+/// linked: its size, mark and invitation are that row's. `None` for a
+/// collection of another kind, or when nothing enters.
+pub(crate) fn gaining(
     conn: &Connection,
+    blobs: &PimdirBlobs,
     collection: &str,
     old: &PimdirHub,
-    new: &PimdirHub,
+    new: &mut PimdirHub,
 ) -> Result<Option<Entering>, PimdirError> {
-    let mut bodies: Vec<(PimdirLinkId, PimdirHash)> = new
+    let bodies: Vec<(PimdirLinkId, PimdirHash)> = new
         .items
         .iter()
         .filter_map(|(link, item)| {
@@ -71,8 +86,7 @@ pub(crate) fn entering(
             let object = item.object.as_ref()?;
             let stored = prev.is_some() || !item.sources.is_empty();
             let moved = prev.and_then(|prev| prev.object.as_ref()) != Some(object);
-            (stored && moved && !item.deleted && !link.is_derived())
-                .then(|| (link.clone(), object.clone()))
+            (stored && moved && !item.deleted).then(|| (link.clone(), object.clone()))
         })
         .collect();
     if bodies.is_empty() || kind_of(conn, collection)? != MAIL {
@@ -89,25 +103,116 @@ pub(crate) fn entering(
         .flatten();
 
     // NOTE: lookup_objects answers the bodies a link id already has in
-    // the account, which is what a move, a copy or a second label carry.
+    // the account, which is what a move, a copy or a second label carry;
+    // a writer-derived key never matches, so its body is always read.
     let links: Vec<&str> = bodies.iter().map(|(link, _)| link.as_str()).collect();
     let mut stmt = conn.prepare(sql::LOOKUP_OBJECTS)?;
-    let held: BTreeSet<(String, String)> = stmt
+    let held: BTreeMap<(String, String), i64> = stmt
         .query_map(
             named_params! {
                 ":links": serde_json::to_string(&links)?,
                 ":account": account.as_deref(),
             },
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    row.get::<_, i64>(2)?,
+                ))
+            },
         )?
         .collect::<Result<_, _>>()?;
-    bodies.retain(|(link, hash)| !held.contains(&(link.0.clone(), hash.0.clone())));
 
-    Ok((!bodies.is_empty()).then(|| Entering {
+    let mut entering = Vec::new();
+    for (link, hash) in bodies {
+        let found = match held.get(&(link.0.clone(), hash.0.clone())) {
+            Some(size) => Body::Held(held_columns(conn, &link, &hash, account.as_deref())?, *size),
+            None => match walk(blobs, &hash)? {
+                Some(parts) => Body::Read(parts),
+                None => {
+                    log::warn!(
+                        "body {} of {} in {collection} is not in the blob store, \
+                         nothing read off it",
+                        hash.0,
+                        link.0,
+                    );
+                    continue;
+                }
+            },
+        };
+
+        let summary = new
+            .items
+            .get_mut(&link)
+            .and_then(|item| item.summary.as_mut());
+        if let Some(PimdirSummary::Mail(mail)) = summary {
+            match &found {
+                Body::Held((attachment, invitation), size) => {
+                    mail.size = Some((*size).max(0) as u64);
+                    if attachment.is_some() {
+                        mail.attachment = *attachment;
+                    }
+                    if invitation.is_some() {
+                        mail.invitation = invitation.clone();
+                    }
+                }
+                Body::Read(parts) => {
+                    mail.attachment = Some(parts.attachment);
+                    if parts.invitation.is_some() {
+                        mail.invitation = parts.invitation.clone();
+                    }
+                }
+            }
+        }
+
+        if let Body::Read(parts) = found
+            && !parts.attachments.is_empty()
+            && !link.is_derived()
+        {
+            entering.push((link, parts.attachments));
+        }
+    }
+
+    Ok((!entering.is_empty()).then(|| Entering {
         collection: collection.into(),
         account,
-        bodies,
+        bodies: entering,
     }))
+}
+
+/// What a body gaining a row gives it.
+enum Body {
+    /// Held by a row of the account: that row's mark and invitation, and
+    /// the body's size.
+    Held((Option<bool>, Option<String>), i64),
+    /// Read now, entering the store.
+    Read(PimdirParts),
+}
+
+/// The mark and invitation a row of the account holding `hash` under
+/// `link` states (`held_mail_summary`), each `None` when none does.
+fn held_columns(
+    conn: &Connection,
+    link: &PimdirLinkId,
+    hash: &PimdirHash,
+    account: Option<&str>,
+) -> rusqlite::Result<(Option<bool>, Option<String>)> {
+    Ok(conn
+        .query_row(
+            sql::HELD_MAIL_SUMMARY,
+            named_params! {
+                ":link_id": link.as_str(),
+                ":object": hash.0,
+                ":account": account,
+            },
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?.map(|mark| mark != 0),
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .unwrap_or_default())
 }
 
 /// Records the stand-ins of the bodies entering, once the diff that
@@ -115,39 +220,17 @@ pub(crate) fn entering(
 /// attachments collection, created on demand, and the `attachment`
 /// reference from the message. A part the collection holds already
 /// keeps its stand-in.
-pub(crate) fn record(
-    conn: &Connection,
-    blobs: &PimdirBlobs,
-    entering: Entering,
-) -> Result<(), PimdirError> {
-    let mut attachments: Option<Option<String>> = None;
+pub(crate) fn record(conn: &Connection, entering: Entering) -> Result<(), PimdirError> {
+    let Some(collection) = collection_of(conn, entering.account.as_deref())? else {
+        log::warn!(
+            "the attachments collection of {} is taken by another kind, \
+             no attachment recorded",
+            entering.collection,
+        );
+        return Ok(());
+    };
 
-    for (message, hash) in entering.bodies {
-        let parts = match walk(blobs, &hash)? {
-            Some(parts) if !parts.is_empty() => parts,
-            Some(_) => continue,
-            None => {
-                log::warn!(
-                    "body {} of {} in {} is not in the blob store, no attachment recorded",
-                    hash.0,
-                    message.0,
-                    entering.collection,
-                );
-                continue;
-            }
-        };
-        let collection = match &attachments {
-            Some(collection) => collection.clone(),
-            None => {
-                let found = collection_of(conn, entering.account.as_deref())?;
-                attachments = Some(found.clone());
-                found
-            }
-        };
-        let Some(collection) = collection else {
-            continue;
-        };
-
+    for (message, parts) in entering.bodies {
         for summary in parts {
             let Some(section) = summary.part.as_deref() else {
                 continue;
@@ -184,12 +267,9 @@ pub(crate) fn record(
     Ok(())
 }
 
-/// The attachments of a stored body, read a chunk at a time and no
+/// What the walk reads off a stored body, read a chunk at a time and no
 /// further than the walk needs; `None` when the blob store lacks it.
-fn walk(
-    blobs: &PimdirBlobs,
-    hash: &PimdirHash,
-) -> Result<Option<Vec<PimdirFileSummary>>, PimdirError> {
+fn walk(blobs: &PimdirBlobs, hash: &PimdirHash) -> Result<Option<PimdirParts>, PimdirError> {
     let Some(mut file) = blobs.reader(hash)? else {
         return Ok(None);
     };
@@ -204,7 +284,7 @@ fn walk(
         };
         walk.feed(&buffer[..read]);
     }
-    Ok(Some(walk.finish()))
+    Ok(Some(walk.finish_parts()))
 }
 
 /// The account's attachments collection: the file collection holding the

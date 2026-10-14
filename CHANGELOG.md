@@ -8,6 +8,8 @@ All notable changes to this project are documented in this file. The format is b
 
 - Added stand-ins recorded as a body enters (pimdir draft-04, STORAGE §14.3): a write bringing a message's body into the store records, in its transaction, one file at `Meta` per part carrying `Content-Disposition: attachment` in the account's attachments collection (the file collection with the role `attachments`, else `<account>/\u0001attachments`, declared with that role) and the `attachment` reference from the message, whatever wrote the body (a sync, an upgrade, a drained `add`, a direct write). A body the account already held under its key (a move, a copy, a second label, the same body again) walks nothing, and bodies held before are never backfilled.
 - Added `summary::mail::attachments`: `PimdirAttachmentWalk`, the walk of a message's parts fed a chunk at a time with bounded memory, and `attachments(body)`, answering each attachment's section, name, media type and decoded size as a `PimdirFileSummary`; `ATTACHMENTS_MAX`, `HEADER_MAX` and `LINE_HEAD`.
+- Added the attachment mark and the invitation to the streamed walk (pimdir Annex A.1): `PimdirAttachmentWalk::finish_parts` and `parts(body)` answer `PimdirParts { attachments, attachment, invitation }`, equal to what `derive` reads off the whole body, a writer streaming a body to its blob now deriving its invitation too; `CALENDAR_LINE_MAX`.
+- Added the canonical `held_mail_summary` statement (pimdir draft-04, STORAGE §14).
 
 - Added round heads (pimdir draft-04, SYNC §4, §5). A run resuming an open round first asks for the round's head, so a message arriving during a long round shows at the next run rather than once the round has closed.
   - The connector side: `PimdirRemote::heads` (default none), `PimdirHeads`, `PimdirHead` (`Delta` from a checkpoint, `Band` from the instant the round opened), `PimdirListing::Head`, `PimdirEnumerate::head`, `PimdirEnumerated::HeadRejected` and `NoHead`, and `PimdirRemoteSnapshot::band_head`; `PimdirSync::heads` for a runner of its own, which `PimdirSourceStore::sync` sets from the remote.
@@ -21,6 +23,9 @@ All notable changes to this project are documented in this file. The format is b
 - Changed `PimdirWriteOp::SetRoundCursor::cursor` to an `Option<PimdirCursor>`, `None` keeping the cursor a page landed, and the vendored `set_round_cursor` to coalesce it (pimdir draft-04, STORAGE §10). Added `PimdirListing::Head` and two `PimdirEnumerated` variants, which an exhaustive match must now handle. **Breaking.**
 
 ### Fixed
+
+- Fixed a mail row holding a body with columns read without it (pimdir Annex A.1). A body entering the store now states, in the write, the mark and invitation its walk gives over the writer's; a placement linked to a body the account already holds (an upgrade linking from the store, a copy, a move, a second label) takes the body's size and a held row's mark and invitation, where it kept its listing's guess forever.
+- Fixed the invitation of a quoted-printable or base64 calendar part holding octets that are no UTF-8: the transfer encoding is now undone on the octets, before they are read as text.
 
 - Fixed a stack overflow deriving a message nested thousands of multipart levels deep (about 350 KB on a 1 MiB stack): the walk for the attachment mark and the invitation stops at `MIME_DEPTH_MAX`. Fixed the same for a calendar body nesting components deeply, whose tree now keeps the three levels the derivation reads.
 

@@ -12,6 +12,13 @@
 //! part, the first [`LINE_HEAD`] octets of any other line, one boundary
 //! per open level, and at most [`ATTACHMENTS_MAX`] summaries. A part's
 //! bytes are counted, never kept.
+//!
+//! The same walk reads the message's invitation (Annex A.1), the first
+//! `UID` of the first `text/calendar` part stating one, its transfer
+//! encoding undone and its lines unfolded, keeping one unfolded line of
+//! at most [`CALENDAR_LINE_MAX`] octets: a writer that read the body as
+//! it streamed, never whole, learns it in the same pass
+//! ([`PimdirAttachmentWalk::finish_parts`]).
 
 use alloc::{
     format,
@@ -35,6 +42,26 @@ pub const HEADER_MAX: usize = 64 * 1024;
 /// delimiter from content; a boundary that would not fit opens nothing.
 pub const LINE_HEAD: usize = 1024;
 
+/// The octets of one unfolded line of a `text/calendar` part the walk
+/// keeps while it looks for the invitation: a `UID` line longer than
+/// this is not read, and the message reads as stating none.
+pub const CALENDAR_LINE_MAX: usize = 64 * 1024;
+
+/// What the walk of a message reads off its parts.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirParts {
+    /// The parts carrying `Content-Disposition: attachment`, in document
+    /// order, as the summaries of the files standing for them.
+    pub attachments: Vec<PimdirFileSummary>,
+    /// The attachment mark (Annex A.1): whether a part, or the message
+    /// itself, carries `Content-Disposition: attachment`, as
+    /// [`derive`](super::derive) reads it with the body.
+    pub attachment: bool,
+    /// The `UID` the first `text/calendar` part stating one carries
+    /// (Annex A.1), as [`derive`](super::derive) reads it.
+    pub invitation: Option<String>,
+}
+
 /// The parts of `body` carrying `Content-Disposition: attachment`, in
 /// document order, as the summaries of the files standing for them
 /// (Annex A.7), `part` set to each one's section.
@@ -44,13 +71,23 @@ pub fn attachments(body: &[u8]) -> Vec<PimdirFileSummary> {
     walk.finish()
 }
 
+/// What the walk reads off `body` held in memory: its attachments, its
+/// attachment mark and its invitation.
+pub fn parts(body: &[u8]) -> PimdirParts {
+    let mut walk = PimdirAttachmentWalk::new();
+    walk.feed(body);
+    walk.finish_parts()
+}
+
 /// The walk of a message fed a chunk at a time ([`attachments`] for a
 /// body held in memory).
 ///
 /// Feed it the stored octets in order with [`feed`](Self::feed), as
 /// long as [`done`](Self::done) says it still reads, then take the
-/// summaries with [`finish`](Self::finish). A single-part message is
-/// done once its header block is read.
+/// summaries with [`finish`](Self::finish), or them, the attachment mark
+/// and the invitation with [`finish_parts`](Self::finish_parts). A
+/// single-part message is done once its header block is read, a
+/// `text/calendar` one once its `UID` is.
 #[derive(Debug)]
 pub struct PimdirAttachmentWalk {
     /// The first octets of the line being read, its terminator excluded.
@@ -67,6 +104,14 @@ pub struct PimdirAttachmentWalk {
     mode: Mode,
     /// The summaries recorded so far, `size` set as each part ends.
     found: Vec<PimdirFileSummary>,
+    /// The `text/calendar` part under way, read for its `UID`.
+    calendar: Option<Calendar>,
+    /// The invitation a part that ended gave: `Some(None)` for a `UID`
+    /// too long to read, which ends the search as a read one does.
+    invitation: Option<Option<String>>,
+    /// Whether the message's own header block disposes it as an
+    /// attachment: a multipart one has no section, so no summary.
+    disposed: bool,
 }
 
 /// Where the octets of a line past its head go.
@@ -97,6 +142,9 @@ struct Frame {
     /// Where the summaries of the child under way start, `None` before
     /// the first delimiter: a child no delimiter ends is no part.
     child_start: Option<usize>,
+    /// Whether the invitation was read before the child under way began,
+    /// so a child cut short takes back only one it gave.
+    invited_before: bool,
 }
 
 /// What the lines of the current entity are.
@@ -136,17 +184,23 @@ impl PimdirAttachmentWalk {
                 depth: 0,
             },
             found: Vec::new(),
+            calendar: None,
+            invitation: None,
+            disposed: false,
         }
     }
 
     /// Whether nothing the walk has yet to read can add an attachment or
-    /// end one: no multipart level is open and no attachment is being
-    /// counted, so a reader may stop feeding it.
+    /// end one, nor change the invitation: no multipart level is open, no
+    /// attachment is being counted and no calendar part is still read,
+    /// so a reader may stop feeding it.
     pub fn done(&self) -> bool {
         self.frames.is_empty()
             && match &self.mode {
                 Mode::Header { .. } => false,
-                Mode::Leaf(counter) => counter.is_none(),
+                Mode::Leaf(counter) => {
+                    counter.is_none() && self.calendar.as_ref().is_none_or(Calendar::settled)
+                }
                 Mode::Skip => true,
             }
     }
@@ -171,7 +225,13 @@ impl PimdirAttachmentWalk {
     }
 
     /// Ends the message, answering its attachments in document order.
-    pub fn finish(mut self) -> Vec<PimdirFileSummary> {
+    pub fn finish(self) -> Vec<PimdirFileSummary> {
+        self.finish_parts().attachments
+    }
+
+    /// Ends the message, answering its attachments in document order and
+    /// its invitation.
+    pub fn finish_parts(mut self) -> PimdirParts {
         if self.open || self.cr {
             if self.cr {
                 self.cr = false;
@@ -182,13 +242,24 @@ impl PimdirAttachmentWalk {
         if matches!(self.mode, Mode::Header { .. }) {
             self.end_headers();
         }
-        // NOTE: a child the outermost level never ended is no part, as
-        // the walk for the mark slices them (Annex A.1).
-        if let Some(start) = self.frames.first().and_then(|frame| frame.child_start) {
-            self.found.truncate(start);
-        }
         self.close_leaf(true);
-        self.found
+        // NOTE: a child the outermost level never ended is no part, as
+        // the walk for the mark slices them (Annex A.1), so neither its
+        // attachments nor its invitation count.
+        if let Some(frame) = self.frames.first()
+            && let Some(start) = frame.child_start
+        {
+            self.found.truncate(start);
+            if !frame.invited_before {
+                self.invitation = None;
+            }
+        }
+        let attachment = self.disposed || !self.found.is_empty();
+        PimdirParts {
+            attachments: self.found,
+            attachment,
+            invitation: self.invitation.flatten(),
+        }
     }
 
     /// Octets of the line under way, its `\n` excluded.
@@ -233,6 +304,9 @@ impl PimdirAttachmentWalk {
                 if let Mode::Leaf(Some((_, counter))) = &mut self.mode {
                     counter.bytes(bytes);
                 }
+                if let Some(calendar) = &mut self.calendar {
+                    calendar.bytes(bytes);
+                }
             }
             Route::Drop | Route::Done => {}
         }
@@ -257,11 +331,16 @@ impl PimdirAttachmentWalk {
         }
         self.route = match &mut self.mode {
             Mode::Header { .. } => Route::Keep,
-            Mode::Leaf(Some((_, counter))) => {
-                counter.bytes(&self.head);
+            Mode::Leaf(counter) if counter.is_some() || self.calendar.is_some() => {
+                if let Some((_, counter)) = counter {
+                    counter.bytes(&self.head);
+                }
+                if let Some(calendar) = &mut self.calendar {
+                    calendar.bytes(&self.head);
+                }
                 Route::Count
             }
-            Mode::Leaf(None) | Mode::Skip => Route::Drop,
+            Mode::Leaf(_) | Mode::Skip => Route::Drop,
         };
     }
 
@@ -280,6 +359,9 @@ impl PimdirAttachmentWalk {
                     if let Mode::Leaf(Some((_, counter))) = &mut self.mode {
                         counter.end_line(terminator);
                     }
+                    if let Some(calendar) = &mut self.calendar {
+                        calendar.end_line(terminator);
+                    }
                 }
                 _ => {}
             }
@@ -294,11 +376,17 @@ impl PimdirAttachmentWalk {
         match &mut self.mode {
             Mode::Header { .. } if self.head.is_empty() => self.end_headers(),
             Mode::Header { .. } => self.header_line(),
-            Mode::Leaf(Some((_, counter))) => {
-                counter.bytes(&self.head);
-                counter.end_line(terminator);
+            Mode::Leaf(counter) => {
+                if let Some((_, counter)) = counter {
+                    counter.bytes(&self.head);
+                    counter.end_line(terminator);
+                }
+                if let Some(calendar) = &mut self.calendar {
+                    calendar.bytes(&self.head);
+                    calendar.end_line(terminator);
+                }
             }
-            Mode::Leaf(None) | Mode::Skip => {}
+            Mode::Skip => {}
         }
     }
 
@@ -336,6 +424,9 @@ impl PimdirAttachmentWalk {
         if let Some(inner) = self.frames.get(level + 1) {
             if let Some(start) = inner.child_start {
                 self.found.truncate(start);
+                if !inner.invited_before {
+                    self.invitation = None;
+                }
             }
             self.frames.truncate(level + 1);
         }
@@ -347,9 +438,11 @@ impl PimdirAttachmentWalk {
         }
 
         let found = self.found.len();
+        let invited = self.invitation.is_some();
         let frame = &mut self.frames[level];
         frame.children += 1;
         frame.child_start = Some(found);
+        frame.invited_before = invited;
         self.mode = Mode::Header {
             block: Vec::new(),
             section: Some(format!("{}{}", frame.prefix, frame.children)),
@@ -373,6 +466,9 @@ impl PimdirAttachmentWalk {
         let attached = field(&headers, "content-disposition")
             .and_then(|value| value.split(';').next())
             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("attachment"));
+        if depth == 0 && attached {
+            self.disposed = true;
+        }
         let content_type = field(&headers, "content-type");
         let opened = match content_type.and_then(boundary) {
             Some(boundary) if depth < MIME_DEPTH_MAX && boundary.len() + 4 <= LINE_HEAD => {
@@ -407,12 +503,21 @@ impl PimdirAttachmentWalk {
                     prefix: section.map(|section| section + ".").unwrap_or_default(),
                     children: 0,
                     child_start: None,
+                    invited_before: false,
                 });
                 self.mode = Mode::Skip;
             }
             None => {
                 let encoding = field(&headers, "content-transfer-encoding")
                     .map(|value| value.trim().to_ascii_lowercase());
+                // NOTE: read whether or not it is disposed as an
+                // attachment, as the derivation reads it (Annex A.1).
+                let calendar = content_type
+                    .and_then(|value| value.split(';').next())
+                    .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/calendar"));
+                if calendar && self.invitation.is_none() {
+                    self.calendar = Some(Calendar::new(encoding.as_deref()));
+                }
                 self.mode =
                     Mode::Leaf(recorded.map(|index| (index, Counter::new(encoding.as_deref()))));
             }
@@ -421,7 +526,8 @@ impl PimdirAttachmentWalk {
 
     /// Ends the attachment being counted, its size set; a pending line
     /// break counts only at the end of the message, any other belonging
-    /// to the delimiter that follows (RFC 2046 §5.1.1).
+    /// to the delimiter that follows (RFC 2046 §5.1.1). A calendar part
+    /// ends too, its `UID`, if it read one, the invitation.
     fn close_leaf(&mut self, at_end: bool) {
         if let Mode::Leaf(Some((index, counter))) = &mut self.mode {
             let size = counter.size(at_end);
@@ -429,6 +535,11 @@ impl PimdirAttachmentWalk {
                 found.size = Some(size);
             }
             self.mode = Mode::Leaf(None);
+        }
+        if let Some(calendar) = self.calendar.take()
+            && let Some(invitation) = calendar.finish()
+        {
+            self.invitation = Some(invitation);
         }
     }
 }
@@ -768,6 +879,222 @@ impl Counter {
                     }
             }
         }
+    }
+}
+
+/// Reads a `text/calendar` part for its first `UID` as its octets go by,
+/// the way the derivation reads the part whole (Annex A.1): the transfer
+/// encoding undone (base64 decoding to nothing over a foreign byte), the
+/// lines unfolded, each split at its first colon, the name before any
+/// parameter. One unfolded line of at most [`CALENDAR_LINE_MAX`] octets is
+/// kept.
+#[derive(Debug)]
+struct Calendar {
+    encoding: Encoding,
+    /// Quoted-printable: within an `=` escape.
+    escape: Escape,
+    /// Base64: the bits read and not yet an octet, and how many.
+    buffer: u32,
+    bits: u32,
+    /// Base64: a byte outside the alphabet was read.
+    foreign: bool,
+    /// The decoded octets of the line under way, its `\n` excluded.
+    line: Vec<u8>,
+    /// Whether the line under way outgrew the bound.
+    line_over: bool,
+    /// The unfolded line under way, `None` before the first line.
+    unfolded: Option<String>,
+    /// Whether the unfolded line under way outgrew the bound.
+    unfolded_over: bool,
+    /// The `UID` read: `Some(None)` for one too long to read.
+    uid: Option<Option<String>>,
+}
+
+impl Calendar {
+    fn new(encoding: Option<&str>) -> Self {
+        Self {
+            encoding: match encoding {
+                Some("base64") => Encoding::Base64,
+                Some("quoted-printable") => Encoding::QuotedPrintable,
+                _ => Encoding::Identity,
+            },
+            escape: Escape::None,
+            buffer: 0,
+            bits: 0,
+            foreign: false,
+            line: Vec::new(),
+            line_over: false,
+            unfolded: None,
+            unfolded_over: false,
+            uid: None,
+        }
+    }
+
+    /// Whether nothing left of the part can change what it gives: its
+    /// `UID` is read, and no foreign base64 byte can take it back.
+    fn settled(&self) -> bool {
+        self.uid.is_some() && self.encoding != Encoding::Base64
+    }
+
+    /// Raw octets of the part, line breaks included.
+    fn bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            match self.encoding {
+                Encoding::Identity => self.decoded(*byte),
+                Encoding::QuotedPrintable => self.quoted(*byte),
+                Encoding::Base64 => self.sextet(*byte),
+            }
+        }
+    }
+
+    /// The line break ending a raw line, `terminator` its octets.
+    fn end_line(&mut self, terminator: u64) {
+        match terminator {
+            2 => self.bytes(b"\r\n"),
+            1 => self.bytes(b"\n"),
+            _ => {}
+        }
+    }
+
+    /// One base64 character: whitespace and padding skipped, anything
+    /// else outside the alphabet foreign.
+    fn sextet(&mut self, byte: u8) {
+        if self.foreign {
+            return;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b' ' | b'\t' | b'\r' | b'\n' => return,
+            _ => {
+                self.foreign = true;
+                return;
+            }
+        };
+        self.buffer = (self.buffer << 6) | u32::from(value);
+        self.bits += 6;
+        if self.bits >= 8 {
+            self.bits -= 8;
+            self.decoded((self.buffer >> self.bits) as u8);
+            self.buffer &= (1 << self.bits) - 1;
+        }
+    }
+
+    /// One quoted-printable octet: an `=` and two hexadecimal digits are
+    /// the octet they spell, any other `=` itself, as RFC 2045 rule 1
+    /// reads with no soft break undone, as the derivation does.
+    fn quoted(&mut self, byte: u8) {
+        match self.escape {
+            Escape::None if byte == b'=' => self.escape = Escape::Equals,
+            Escape::None => self.decoded(byte),
+            Escape::Equals if byte.is_ascii_hexdigit() => self.escape = Escape::Hex(byte),
+            Escape::Equals => {
+                self.escape = Escape::None;
+                self.decoded(b'=');
+                self.quoted(byte);
+            }
+            Escape::Hex(high) => {
+                self.escape = Escape::None;
+                match hex_pair(high, byte) {
+                    Some(octet) => self.decoded(octet),
+                    None => {
+                        self.decoded(b'=');
+                        self.decoded(high);
+                        self.quoted(byte);
+                    }
+                }
+            }
+        }
+    }
+
+    /// One decoded octet.
+    fn decoded(&mut self, byte: u8) {
+        if self.uid.is_some() {
+            return;
+        }
+        match byte {
+            b'\n' => self.end_physical(),
+            _ if self.line.len() < CALENDAR_LINE_MAX => self.line.push(byte),
+            _ => self.line_over = true,
+        }
+    }
+
+    /// Ends a decoded line: a line opening with a space or a tab
+    /// continues the one before it, that one character dropped (RFC 5545
+    /// §3.1), any other ends it.
+    fn end_physical(&mut self) {
+        let line = core::mem::take(&mut self.line);
+        let over = core::mem::take(&mut self.line_over);
+        let text = String::from_utf8_lossy(&line);
+        let text = text.strip_suffix('\r').unwrap_or(&text);
+
+        match (text.strip_prefix([' ', '\t']), &mut self.unfolded) {
+            (Some(rest), Some(unfolded)) => {
+                if unfolded.len() + rest.len() <= CALENDAR_LINE_MAX {
+                    unfolded.push_str(rest);
+                } else {
+                    self.unfolded_over = true;
+                }
+                self.unfolded_over |= over;
+            }
+            _ => {
+                self.end_unfolded();
+                self.unfolded = Some(text.to_string());
+                self.unfolded_over = over;
+            }
+        }
+    }
+
+    /// Ends an unfolded line, its value the `UID` when its name is one.
+    /// One too long to keep is a `UID` too long to read when what it
+    /// kept names one.
+    fn end_unfolded(&mut self) {
+        let Some(line) = self.unfolded.take() else {
+            return;
+        };
+        if self.uid.is_some() {
+            return;
+        }
+        if core::mem::take(&mut self.unfolded_over) {
+            let name = line.split([':', ';']).next().unwrap_or_default();
+            if line.contains([':', ';']) && name.eq_ignore_ascii_case("UID") {
+                self.uid = Some(None);
+            }
+            return;
+        }
+        if let Some((name, value)) = line.split_once(':')
+            && name
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("UID")
+        {
+            self.uid = Some(Some(value.to_string()));
+        }
+    }
+
+    /// Ends the part: the `UID` it gives, `None` when it states none or
+    /// its base64 decodes to nothing.
+    fn finish(mut self) -> Option<Option<String>> {
+        if self.foreign {
+            return None;
+        }
+        match self.escape {
+            Escape::None => {}
+            Escape::Equals => self.decoded(b'='),
+            Escape::Hex(high) => {
+                self.decoded(b'=');
+                self.decoded(high);
+            }
+        }
+        if self.uid.is_none() {
+            self.end_physical();
+            self.end_unfolded();
+        }
+        self.uid
     }
 }
 

@@ -18,7 +18,9 @@ use io_pimdir::{
         PimdirStatus,
     },
     reference::{PimdirEndpoint, PimdirReferenceOrigin, PimdirReferenceRole},
+    remote::PimdirTier,
     summary::{
+        PimdirSummary,
         file::{self, PimdirFileSummary},
         mail,
     },
@@ -432,4 +434,208 @@ fn a_store_of_one_account_files_them_under_no_account() {
         .find(|collection| collection.id == "\u{1}attachments")
         .unwrap();
     assert_eq!(collection.role.as_deref(), Some("attachments"));
+}
+
+/// An invitation: a `multipart/mixed` whose calendar part is inline and
+/// base64, so the mark read without the body guesses one attachment and
+/// no invitation, and the body gives none and a `UID`.
+const INVITE: &[u8] = b"Message-ID: <invite-3@example.org>\r\n\
+From: Alice <alice@example.org>\r\n\
+Subject: Stand-up\r\n\
+Date: Mon, 05 Oct 2026 09:00:00 +0000\r\n\
+Content-Type: multipart/mixed; boundary=\"b\"\r\n\
+\r\n\
+--b\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Join us.\r\n\
+--b\r\n\
+Content-Type: text/calendar; method=REQUEST\r\n\
+Content-Transfer-Encoding: base64\r\n\
+\r\n\
+QkVHSU46VkNBTEVOREFSDQpCRUdJTjpWRVZFTlQNClVJRDpzdGFuZC11cA0KIEBleGFtcGxlLm9y\r\n\
+Zw0KRU5EOlZFVkVOVA0KRU5EOlZDQUxFTkRBUg0K\r\n\
+--b--\r\n";
+
+const INVITE_LINK: &str = "invite-3@example.org";
+const UID: &str = "stand-up@example.org";
+
+/// The summary a listing reads of `body` without it, stating `size`.
+fn listed(
+    collection: &str,
+    handle: &str,
+    link: &str,
+    body: &[u8],
+    size: Option<u64>,
+) -> PimdirPlacement {
+    let mut placement = placement(collection, handle, link, None);
+    placement.summary = mail::derive_meta(body, size, None).summary;
+    placement
+}
+
+/// The size, mark and invitation of the row of `link` in `collection`,
+/// as a load reads it.
+fn columns(
+    store: &mut PimdirSourceStore,
+    collection: &str,
+    link: &str,
+) -> (Option<u64>, Option<bool>, Option<String>) {
+    let loaded = store.open_collection(collection).unwrap();
+    let placement = loaded
+        .placements
+        .into_iter()
+        .find(|placement| {
+            placement
+                .link_id
+                .as_ref()
+                .is_some_and(|key| key.as_str() == link)
+        })
+        .unwrap();
+    match placement.summary {
+        Some(PimdirSummary::Mail(mail)) => (mail.size, mail.attachment, mail.invitation),
+        other => panic!("a mail row, not {other:?}"),
+    }
+}
+
+#[test]
+fn a_body_read_without_it_states_what_its_parts_give() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+
+    // NOTE: the derivation agrees with the walk on both.
+    let derived = match mail::derive(INVITE).summary {
+        Some(PimdirSummary::Mail(mail)) => mail,
+        _ => unreachable!("a message derives a mail summary"),
+    };
+    assert_eq!(derived.attachment, Some(false));
+    assert_eq!(derived.invitation.as_deref(), Some(UID));
+
+    // NOTE: a writer streaming the body states the header block's guess,
+    // as neverest's header capture does.
+    let mut streamed = listed("INBOX", "1", INVITE_LINK, INVITE, Some(INVITE.len() as u64));
+    streamed.object = Some(hash_of(INVITE));
+    streamed.level = PimdirLevel::Full;
+    streamed.base.as_mut().unwrap().object = Some(hash_of(INVITE));
+    assert!(matches!(
+        &streamed.summary,
+        Some(PimdirSummary::Mail(mail)) if mail.attachment == Some(true) && mail.invitation.is_none()
+    ));
+    store
+        .write(vec![
+            store_object(INVITE),
+            PimdirWriteOp::UpsertPlacement(streamed),
+        ])
+        .unwrap();
+
+    assert_eq!(
+        columns(&mut store, "INBOX", INVITE_LINK),
+        (Some(INVITE.len() as u64), Some(false), Some(UID.into()))
+    );
+}
+
+#[test]
+fn a_copy_of_a_held_body_takes_the_columns_its_body_gave() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    stored(&mut store, "INBOX", "1", LINK, BODY);
+    stored(&mut store, "INBOX", "2", INVITE_LINK, INVITE);
+    let before = collection_rows(&store);
+
+    // NOTE: an IMAP COPY into Archive, the store linking the held body
+    // to the listed member without a fetch: its listing guessed no
+    // attachment for one, one for the other, and stated no size.
+    for (handle, link, body) in [("8", LINK, BODY), ("9", INVITE_LINK, INVITE)] {
+        let mut copy = listed("Archive", handle, link, body, None);
+        if let Some(PimdirSummary::Mail(mail)) = &mut copy.summary {
+            mail.attachment = Some(link == INVITE_LINK);
+        }
+        copy.object = Some(hash_of(body));
+        copy.level = PimdirLevel::Full;
+        copy.base.as_mut().unwrap().object = Some(hash_of(body));
+        store
+            .write(vec![PimdirWriteOp::UpsertPlacement(copy)])
+            .unwrap();
+    }
+
+    assert_eq!(
+        columns(&mut store, "Archive", LINK),
+        (Some(BODY.len() as u64), Some(true), None)
+    );
+    assert_eq!(
+        columns(&mut store, "Archive", INVITE_LINK),
+        (Some(INVITE.len() as u64), Some(false), Some(UID.into()))
+    );
+    assert_eq!(collection_rows(&store), before, "a copy enters nothing");
+}
+
+/// A remote an upgrade linking from the store never reaches.
+struct Unreached;
+
+impl io_pimdir::remote::PimdirRemote for Unreached {
+    type Error = std::convert::Infallible;
+
+    fn enumerate(
+        &mut self,
+        _: &PimdirCollectionId,
+        _: io_pimdir::remote::PimdirEnumerate,
+    ) -> Result<io_pimdir::remote::PimdirEnumerated, Self::Error> {
+        unreachable!("an upgrade never enumerates")
+    }
+
+    fn fetch(
+        &mut self,
+        _: &PimdirCollectionId,
+        _: Vec<PimdirHandle>,
+        _: PimdirTier,
+    ) -> Result<Vec<io_pimdir::remote::PimdirFetchedItem>, Self::Error> {
+        unreachable!("a held body is linked, never fetched")
+    }
+
+    fn push(
+        &mut self,
+        _: &PimdirCollectionId,
+        _: Vec<io_pimdir::change::PimdirChange>,
+    ) -> Result<Vec<io_pimdir::remote::PimdirPushResult>, Self::Error> {
+        unreachable!("an upgrade never pushes")
+    }
+}
+
+#[test]
+fn an_upgrade_linking_a_held_body_takes_the_columns_its_body_gave() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = opened(dir.path());
+    stored(&mut store, "INBOX", "1", INVITE_LINK, INVITE);
+
+    // NOTE: the second label, listed at Meta with the server's size.
+    store
+        .write(vec![PimdirWriteOp::UpsertPlacement(listed(
+            "Archive",
+            "9",
+            INVITE_LINK,
+            INVITE,
+            Some(INVITE.len() as u64),
+        ))])
+        .unwrap();
+    assert_eq!(
+        columns(&mut store, "Archive", INVITE_LINK),
+        (Some(INVITE.len() as u64), Some(true), None),
+        "the listing's guess"
+    );
+
+    let report = store
+        .upgrade(
+            "Archive",
+            vec![PimdirHandle::from("9")],
+            PimdirTier::Full,
+            &mut Unreached,
+        )
+        .unwrap();
+    assert_eq!((report.upgraded, report.deduped), (1, 1));
+
+    let item = store.list_items("Archive", None, 10).unwrap();
+    assert_eq!(item[0].object, Some(hash_of(INVITE)));
+    assert_eq!(
+        columns(&mut store, "Archive", INVITE_LINK),
+        (Some(INVITE.len() as u64), Some(false), Some(UID.into()))
+    );
 }

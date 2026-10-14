@@ -212,8 +212,8 @@ fn encoded_word(text: &str) -> Option<(String, usize)> {
     let payload = &rest[..end];
 
     let bytes = match encoding {
-        "B" | "b" => base64(payload)?,
-        "Q" | "q" => quoted_printable(payload, true),
+        "B" | "b" => base64(payload.as_bytes())?,
+        "Q" | "q" => quoted_printable(payload.as_bytes(), true),
         _ => return None,
     };
 
@@ -254,9 +254,10 @@ fn cp1252(byte: u8) -> char {
 }
 
 /// Decodes RFC 2045 quoted-printable, with the `_` of RFC 2047 §4.2 when
-/// `header` is set.
-fn quoted_printable(text: &str, header: bool) -> Vec<u8> {
-    let bytes = text.as_bytes();
+/// `header` is set, octet by octet: an octet that is no UTF-8 passes
+/// through as itself, replaced only once the decoded text is read
+/// (Annex A.0).
+fn quoted_printable(bytes: &[u8], header: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
 
@@ -292,12 +293,12 @@ fn hex_pair(high: u8, low: u8) -> Option<u8> {
 }
 
 /// Decodes RFC 4648 base64, ignoring whitespace; `None` on a foreign byte.
-fn base64(text: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() * 3 / 4);
+fn base64(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
     let mut buffer: u32 = 0;
     let mut bits = 0;
 
-    for byte in text.bytes() {
+    for &byte in bytes {
         let value = match byte {
             b'A'..=b'Z' => byte - b'A',
             b'a'..=b'z' => byte - b'a' + 26,
@@ -600,11 +601,12 @@ fn invitation(headers: &[(String, String)], body: &[u8], depth: usize) -> Option
         .trim()
         .to_lowercase();
     if media == "text/calendar" {
+        // NOTE: the octets decoded before any is read as text, so the
+        // streamed walk (attachments::PimdirAttachmentWalk) reads alike.
         let encoding = field(headers, "content-transfer-encoding").map(str::to_lowercase);
-        let text = String::from_utf8_lossy(body);
         let decoded = match encoding.as_deref().map(str::trim) {
-            Some("base64") => base64(&text).unwrap_or_default(),
-            Some("quoted-printable") => quoted_printable(&text, false),
+            Some("base64") => base64(body).unwrap_or_default(),
+            Some("quoted-printable") => quoted_printable(body, false),
             _ => body.to_vec(),
         };
         return unfold(&decoded, false).into_iter().find_map(|line| {

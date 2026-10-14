@@ -243,7 +243,26 @@ fn every_summary_vector_derives() {
             for chunk in body.chunks(7) {
                 walk.feed(chunk);
             }
-            assert_eq!(walk.finish(), whole, "{label}: attachments fed in chunks");
+            let parts = walk.finish_parts();
+            assert_eq!(
+                parts.attachments, whole,
+                "{label}: attachments fed in chunks"
+            );
+
+            // NOTE: the streamed walk's mark and invitation are the row's,
+            // so a writer never holding the body whole derives alike.
+            let PimdirSummary::Mail(mail) = summary else {
+                panic!("{label}: a message derives a mail summary");
+            };
+            assert_eq!(
+                Some(parts.attachment),
+                mail.attachment,
+                "{label}: walked mark"
+            );
+            assert_eq!(
+                parts.invitation, mail.invitation,
+                "{label}: walked invitation"
+            );
             let actual: Vec<Value> = whole
                 .iter()
                 .map(|file| {

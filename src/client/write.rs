@@ -360,13 +360,14 @@ pub(crate) fn apply(
         let mut new = old.clone();
         new.absorb(source, &ops);
         // NOTE: read before the diff is saved, which would make every
-        // body it stores look held already (§14.3).
-        let entering = attachments::entering(tx, &collection, &old, &new)?;
+        // body it stores look held already (§14.3), and which writes the
+        // columns only the body gives as read here (Annex A.1).
+        let entering = attachments::gaining(tx, blobs, &collection, &old, &mut new)?;
         let licensed = licensed.remove(&collection).unwrap_or_default();
         save_hub_diff(tx, &collection, source, &ops, &old, &mut new, &licensed)?;
         adjust_refcounts(tx, &object_refs(&old), &object_refs(&new))?;
         if let Some(entering) = entering {
-            attachments::record(tx, blobs, entering)?;
+            attachments::record(tx, entering)?;
         }
     }
 

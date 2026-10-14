@@ -12,7 +12,7 @@ What a writer derives from an item before its row reaches the store (pimdir STOR
 `summary::derive(kind, body)` SHALL return the `PimdirDerivation` Annex A fixes for `message/rfc822`, `text/vcard` and `text/calendar`, and `None` for a media type it has no conventions for. It SHALL live in the I/O-free core. A calendar resource holding no `VEVENT`, `VTODO` or `VJOURNAL` derives a key and no summary.
 
 ### Requirement: Decoding follows Annex A.0
-A mail header SHALL be decoded (RFC 2047 encoded words, adjacent ones joined) and every address made canonical (the addr-spec alone, lowercased whole, `mailto:` stripped); a vCard or iCalendar text value SHALL be unescaped, a content line split on the first colon outside a quoted parameter, a structured value on the semicolons no backslash escapes. Invalid UTF-8 is replaced, never refused. Unfolding a header removes the CRLF alone and keeps the whitespace (RFC 5322 §2.2.3); unfolding a vCard or iCalendar line takes the one leading character with it.
+A mail header SHALL be decoded (RFC 2047 encoded words, adjacent ones joined) and every address made canonical (the addr-spec alone, lowercased whole, `mailto:` stripped); a vCard or iCalendar text value SHALL be unescaped, a content line split on the first colon outside a quoted parameter, a structured value on the semicolons no backslash escapes. Invalid UTF-8 is replaced, never refused, once the octets are decoded: a transfer encoding is undone on the octets, never on text read from them. Unfolding a header removes the CRLF alone and keeps the whitespace (RFC 5322 §2.2.3); unfolding a vCard or iCalendar line takes the one leading character with it.
 
 An encoded word's charset is decoded by the byte for `iso-8859-1` and `us-ascii`, by its table for `windows-1252` (the 0x80 to 0x9F row is not latin1), and as UTF-8 otherwise. The crate depends on no charset library, so any other 8-bit charset reads its bytes as UTF-8, lossily: a known deviation from Annex A.0, bounded to the headers of messages in charsets the format's vectors do not carry.
 
@@ -38,7 +38,10 @@ The walk of a message's parts SHALL open multipart bodies down to `summary::mail
 - tests/deep_nesting.rs, each case on a 1 MiB thread: 10000 multipart levels and 200000 nested components derive; the walk reaches a part at the bound and not one past it.
 
 ### Requirement: The walk of a message's parts is streamed and bounded
-`summary::mail::attachments::PimdirAttachmentWalk` SHALL take a body a chunk at a time and keep at most `HEADER_MAX` octets of a header block, `LINE_HEAD` of any other line, one boundary per open level down to `MIME_DEPTH_MAX` and `ATTACHMENTS_MAX` summaries, answering the same whatever the chunking; it SHALL stand for exactly the parts the attachment mark's walk examines and finds disposed as attachments, a part no delimiter ends being none.
+`summary::mail::attachments::PimdirAttachmentWalk` SHALL take a body a chunk at a time and keep at most `HEADER_MAX` octets of a header block, `LINE_HEAD` of any other line, one boundary per open level down to `MIME_DEPTH_MAX`, `ATTACHMENTS_MAX` summaries and one unfolded calendar line of `CALENDAR_LINE_MAX` octets, answering the same whatever the chunking; it SHALL stand for exactly the parts the attachment mark's walk examines and finds disposed as attachments, a part no delimiter ends being none. `finish_parts` SHALL answer the attachment mark and the invitation `summary::mail::derive` gives for the same octets, within those bounds: a `UID` line past `CALENDAR_LINE_MAX` reads as none and ends the search.
 
 #### Scenario: The vectors' attachments
-- tests/summaries.rs, the walk fed whole and in chunks of 7 octets; the unit tests of src/summary/mail/attachments.rs.
+- tests/summaries.rs, the walk fed whole and in chunks of 7 octets, its mark and invitation the row's; the unit tests of src/summary/mail/attachments.rs.
+
+#### Scenario: Streamed or whole, alike
+- tests/walk_agrees.rs: a table of encodings, foldings, nestings and truncations, and a property over built messages fed whole, by 1, 7 and 64 KiB octets and cut anywhere.
