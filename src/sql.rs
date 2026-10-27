@@ -8,8 +8,15 @@
 //! binding.
 //!
 //! The statements of this crate's own are the operator tool's, behind
-//! `pimdir check` and `store info`: nothing on a profile's path, so an
+//! `pimdir check` and `store info`, and the narrowed coverage count the
+//! search coverage reads: nothing on a profile's path, so an
 //! implementation of the standard needs none of them.
+//!
+//! `search` (feature `search`) holds the index's, from
+//! migrations/search/ and queries/search/, on the same terms.
+
+#[cfg(feature = "search")]
+pub mod search;
 
 include!(concat!(env!("OUT_DIR"), "/canonical.rs"));
 
@@ -88,6 +95,16 @@ ORDER BY id;"#;
 DELETE_DANGLING_BINDINGS = r#"DELETE FROM bindings WHERE NOT EXISTS (
   SELECT 1 FROM items i
   WHERE i.collection = bindings.collection AND i.link_id = bindings.link_id);"#;
+
+/// The live items holding no body per collection kind, over the collections
+/// of a JSON array: the canonical search `coverage` narrowed to a scope
+/// (SEARCH §8.2), which the store's own reads answer too. Files are read
+/// from their summary alone, so a bodiless one hides nothing.
+COUNT_BODILESS = r#"SELECT c.kind, count(*) FROM items i JOIN collections c ON c.id = i.collection
+WHERE i.object_hash IS NULL AND i.deleted = 0 AND i.retained_at IS NULL
+  AND c.kind <> 'application/octet-stream'
+  AND i.collection IN (SELECT value FROM json_each(:collections))
+GROUP BY c.kind;"#;
 }
 
 #[cfg(test)]

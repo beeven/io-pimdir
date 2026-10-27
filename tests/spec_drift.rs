@@ -1,7 +1,8 @@
 //! The crate's vendored SQL against the canonical pimdir specification.
 //!
-//! spec/ is a byte-for-byte copy of the specification's migrations/storage/
-//! and queries/storage/, and `sql` is generated from it, so a consumer
+//! spec/ is a byte-for-byte copy of the specification's migrations/storage/,
+//! queries/storage/ and, read by the `search` feature, migrations/search/
+//! and queries/search/, and `sql` is generated from it, so a consumer
 //! holding its own SQLite binding runs the format's own statements by
 //! name. The copy is only worth something if it is checked: the crate and
 //! the spec live in separate repositories, so nothing else notices when
@@ -158,7 +159,12 @@ fn the_vendored_copy_is_the_spec_byte_for_byte() {
     };
     let vendored = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("spec");
 
-    for dir in ["migrations/storage", "queries/storage"] {
+    for dir in [
+        "migrations/storage",
+        "queries/storage",
+        "migrations/search",
+        "queries/search",
+    ] {
         let theirs = tree(&spec.join(dir));
         let ours = tree(&vendored.join(dir));
         let differing: Vec<&PathBuf> = theirs
@@ -169,6 +175,85 @@ fn the_vendored_copy_is_the_spec_byte_for_byte() {
         assert!(
             differing.is_empty(),
             "spec/{dir} differs from the spec checkout, re-vendor it: {differing:?}"
+        );
+    }
+}
+
+/// Every canonical search statement the spec checkout carries, as
+/// `(CONSTANT_NAME, sql)`, on [`canonical_statements`]' terms.
+#[cfg(feature = "search")]
+fn search_statements(spec: &Path) -> Vec<(String, String)> {
+    let mut statements = Vec::new();
+    for entry in fs::read_dir(spec.join("queries/search")).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_stem().unwrap().to_str().unwrap().to_uppercase();
+        statements.push((name, fs::read_to_string(&path).unwrap()));
+    }
+    statements.sort();
+    statements
+}
+
+/// An index database with a store attached as `store`, each at the given
+/// schema, as SEARCH §2 prepares every search statement.
+#[cfg(feature = "search")]
+fn index(store: &str, index: &str) -> (tempfile::TempDir, Connection) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |name: &str| dir.path().join(name);
+    Connection::open(path("pimdir.db"))
+        .unwrap()
+        .execute_batch(store)
+        .expect("the store schema applies to an empty database");
+    let conn = Connection::open(path("index.db")).unwrap();
+    conn.execute_batch(index)
+        .expect("the index schema applies to an empty database");
+    conn.execute(
+        "ATTACH DATABASE ?1 AS store",
+        [path("pimdir.db").to_str().unwrap()],
+    )
+    .unwrap();
+    (dir, conn)
+}
+
+/// Every canonical search statement is reachable by name and prepares on
+/// the canonical index schema with the canonical store attached.
+#[cfg(feature = "search")]
+#[test]
+fn every_canonical_search_statement_is_inlined_and_prepares() {
+    let Some(spec) = spec_dir() else {
+        eprintln!("skipped: no pimdir spec checkout beside this one");
+        return;
+    };
+
+    let inlined: BTreeSet<&str> = sql::search::all().map(|(name, _)| name).collect();
+    let store = fs::read_to_string(spec.join("migrations/storage/0001_init.sql")).unwrap();
+    let schema = fs::read_to_string(spec.join("migrations/search/0001_init.sql")).unwrap();
+    let (_dir, conn) = index(&store, &schema);
+
+    for (name, sql) in search_statements(&spec) {
+        assert!(
+            inlined.contains(name.as_str()),
+            "canonical search `{name}` has no constant here, unreachable by name"
+        );
+        if let Err(err) = conn.prepare(&sql) {
+            panic!(
+                "canonical search `{name}` does not prepare against the canonical schemas: {err:?}"
+            );
+        }
+    }
+}
+
+/// Every search statement, canonical or this crate's own, prepares on
+/// the inlined schemas.
+#[cfg(feature = "search")]
+#[test]
+fn every_inlined_search_statement_prepares() {
+    let (_dir, conn) = index(sql::MIGRATION_0001, sql::search::MIGRATION_0001);
+
+    for (name, text) in sql::search::all() {
+        assert!(
+            conn.prepare(text).is_ok(),
+            "`{name}` does not prepare against the inlined schemas: {:?}",
+            conn.prepare(text).unwrap_err()
         );
     }
 }

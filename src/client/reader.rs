@@ -46,6 +46,7 @@ use crate::{
     object::PimdirHash,
     placement::{PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId},
     reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
+    search::coverage::{PimdirSearchCoverage, PimdirSearchTemporal},
     sql,
     summary::{
         PimdirAddressRole, PimdirSummary,
@@ -1692,6 +1693,43 @@ impl PimdirReader {
         )?;
         self.attach_entry_addresses(&mut entries, PimdirSummaryTable::Mail)?;
         Ok(entries)
+    }
+
+    /// What a search over a set of collections and the range `[since,
+    /// until)` could not see (SEARCH §8.2), RFC 3339 instants with either
+    /// side open: the live items holding no body per kind, and whether
+    /// every collection's coverage (§10) holds the range. What the `LIKE`
+    /// reads above answer about their own hits; the index fills the same
+    /// value for its own.
+    pub fn search_coverage(
+        &self,
+        collections: &[impl AsRef<str>],
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<PimdirSearchCoverage, PimdirError> {
+        let mut coverage = PimdirSearchCoverage::default();
+
+        let bodiless = rows(
+            &self.conn,
+            sql::COUNT_BODILESS,
+            named_params! { ":collections": collections_json(collections)? },
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        for (kind, count) in bodiless {
+            coverage.local.bodiless.insert(kind, count as u64);
+        }
+
+        for collection in collections {
+            let sources = self.list_coverage(collection)?;
+            let scopes = sources
+                .iter()
+                .map(|source| source.coverage.as_ref().map(|coverage| &coverage.scope));
+            coverage
+                .temporal
+                .merge(&PimdirSearchTemporal::over(scopes, since, until));
+        }
+
+        Ok(coverage)
     }
 
     /// Joins the address rows onto a page spanning collections, read for

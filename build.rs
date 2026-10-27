@@ -3,10 +3,11 @@
 //! metadata.
 //!
 //! spec/ is a byte-for-byte copy of the pimdir repository's
-//! migrations/storage/ and queries/storage/; one file per statement,
-//! named after it, sorted by the profile that runs it. Re-vendor by
-//! copying the two directories over, and tests/spec_drift.rs proves the
-//! copy against a sibling checkout.
+//! migrations/storage/, queries/storage/, migrations/search/ and
+//! queries/search/; one file per statement, named after it, the store's
+//! sorted by the profile that runs it. Re-vendor by copying the four
+//! directories over, and tests/spec_drift.rs proves the copy against a
+//! sibling checkout.
 
 use std::{
     env, fs,
@@ -18,8 +19,9 @@ fn main() {
     let spec = root.join("spec");
     println!("cargo:rerun-if-changed=spec");
 
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("canonical.rs");
-    fs::write(out, canonical(&spec)).unwrap();
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
+    fs::write(out.join("canonical.rs"), canonical(&spec)).unwrap();
+    fs::write(out.join("search.rs"), search(&spec)).unwrap();
 
     #[cfg(feature = "cli")]
     cli();
@@ -53,28 +55,7 @@ fn canonical(spec: &Path) -> String {
     let mut names = Vec::new();
     for profile in ["read", "queue", "owner"] {
         for path in files(&spec.join("queries/storage").join(profile)) {
-            let name = path.file_stem().unwrap().to_str().unwrap().to_uppercase();
-            let text = fs::read_to_string(&path).unwrap();
-            let comment: Vec<&str> = text
-                .lines()
-                .take_while(|line| line.starts_with("--"))
-                .collect();
-            if comment.is_empty() {
-                let stem = path.file_stem().unwrap().to_str().unwrap();
-                out += &format!("#[doc = \"The canonical `{stem}` statement (STORAGE §4.4).\"]\n");
-            }
-            for line in comment {
-                let doc = line
-                    .trim_start_matches('-')
-                    .trim_start()
-                    .replace('[', "\\[");
-                out += &format!("#[doc = {doc:?}]\n");
-            }
-            out += &format!(
-                "pub const {name}: &str = include_str!({:?});\n\n",
-                path.display()
-            );
-            names.push(name);
+            names.push(statement(&mut out, &path, "STORAGE §4.4"));
         }
     }
 
@@ -86,6 +67,74 @@ fn canonical(spec: &Path) -> String {
     out += "];\n";
 
     out
+}
+
+/// The generated body of the search module: the index schema of
+/// migrations/search/ and one constant per statement of queries/search/,
+/// on the terms [`canonical`] sets for the store's.
+fn search(spec: &Path) -> String {
+    let mut out = String::new();
+
+    let migrations = files(&spec.join("migrations/search"));
+    out += "/// The index schema version (SEARCH §2): the number of migrations.\n";
+    out += &format!("pub const VERSION: i64 = {};\n\n", migrations.len());
+    for (index, path) in migrations.iter().enumerate() {
+        out += &format!(
+            "/// Index migration {0:04}, migrations/search/{1} verbatim.\n\
+             pub const MIGRATION_{0:04}: &str = include_str!({2:?});\n\n",
+            index + 1,
+            path.file_name().unwrap().to_str().unwrap(),
+            path.display(),
+        );
+    }
+    out += "/// Every index migration in order. There are no index migrations\n";
+    out += "/// proper: an index at another version is rebuilt (SEARCH §2).\n";
+    out += "pub const MIGRATIONS: &[&str] = &[\n";
+    for index in 0..migrations.len() {
+        out += &format!("    MIGRATION_{:04},\n", index + 1);
+    }
+    out += "];\n\n";
+
+    let mut names = Vec::new();
+    for path in files(&spec.join("queries/search")) {
+        names.push(statement(&mut out, &path, "SEARCH §2"));
+    }
+
+    out += "/// Every canonical search statement, paired with its constant name.\n";
+    out += "pub const CANONICAL: &[(&str, &str)] = &[\n";
+    for name in &names {
+        out += &format!("    ({name:?}, {name}),\n");
+    }
+    out += "];\n";
+
+    out
+}
+
+/// Appends one statement's constant, its leading comment as its
+/// documentation, and answers the constant's name.
+fn statement(out: &mut String, path: &Path, section: &str) -> String {
+    let stem = path.file_stem().unwrap().to_str().unwrap();
+    let name = stem.to_uppercase();
+    let text = fs::read_to_string(path).unwrap();
+    let comment: Vec<&str> = text
+        .lines()
+        .take_while(|line| line.starts_with("--"))
+        .collect();
+    if comment.is_empty() {
+        *out += &format!("#[doc = \"The canonical `{stem}` statement ({section}).\"]\n");
+    }
+    for line in comment {
+        let doc = line
+            .trim_start_matches('-')
+            .trim_start()
+            .replace('[', "\\[");
+        *out += &format!("#[doc = {doc:?}]\n");
+    }
+    *out += &format!(
+        "pub const {name}: &str = include_str!({:?});\n\n",
+        path.display()
+    );
+    name
 }
 
 /// The files of a directory, in name order.

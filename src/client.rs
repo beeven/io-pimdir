@@ -46,6 +46,8 @@ mod capability;
 pub mod diagnostics;
 pub mod producer;
 pub mod reader;
+#[cfg(feature = "search")]
+pub mod search;
 
 mod attachments;
 mod lock;
@@ -1050,6 +1052,21 @@ pub enum PimdirError {
         /// The sources declaring it.
         candidates: Vec<String>,
     },
+    /// A search query was refused: unparseable, or naming what this
+    /// implementation does not answer yet (SEARCH §8).
+    #[cfg(feature = "search")]
+    Query(crate::search::query::PimdirQueryError),
+    /// The SQLite linked in lacks what the index requires (SEARCH §2):
+    /// FTS5, or the version 3.43 `contentless_delete` arrived in.
+    #[cfg(feature = "search")]
+    Fts5 {
+        /// The SQLite version linked in.
+        version: &'static str,
+    },
+    /// Another indexer holds index.lock (SEARCH §3) while this one has to
+    /// create or rebuild the index.
+    #[cfg(feature = "search")]
+    Indexing(PathBuf),
 }
 
 impl fmt::Display for PimdirError {
@@ -1143,6 +1160,19 @@ impl fmt::Display for PimdirError {
                 "Several sources can perform {capability} ({}): choose one",
                 candidates.join(", ")
             ),
+            #[cfg(feature = "search")]
+            Self::Query(err) => write!(f, "Pimdir search query refused: {err}"),
+            #[cfg(feature = "search")]
+            Self::Fts5 { version } => write!(
+                f,
+                "Pimdir search needs SQLite 3.43 or later with FTS5, and SQLite {version} is linked in: build with the vendored feature"
+            ),
+            #[cfg(feature = "search")]
+            Self::Indexing(store) => write!(
+                f,
+                "Pimdir index at {} is being refreshed by another process",
+                store.display()
+            ),
         }
     }
 }
@@ -1176,5 +1206,12 @@ impl From<serde_json::Error> for PimdirError {
 impl From<PimdirActionError> for PimdirError {
     fn from(err: PimdirActionError) -> Self {
         Self::Action(err)
+    }
+}
+
+#[cfg(feature = "search")]
+impl From<crate::search::query::PimdirQueryError> for PimdirError {
+    fn from(err: crate::search::query::PimdirQueryError) -> Self {
+        Self::Query(err)
     }
 }

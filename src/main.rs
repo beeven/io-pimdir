@@ -48,8 +48,16 @@ use pimalaya_cli::{
 };
 
 use crate::cli::{
-    StoreFlags, check::CheckCommand, collection::CollectionCommand, export::ExportCommand,
-    gc::GcCommand, item::ItemCommand, json_schema, queue::QueueCommand, store::StoreCommand,
+    StoreFlags,
+    check::CheckCommand,
+    collection::CollectionCommand,
+    export::ExportCommand,
+    gc::GcCommand,
+    item::ItemCommand,
+    json_schema,
+    queue::QueueCommand,
+    search::{CountCommand, IndexCommand, SearchCommand, ShowCommand},
+    store::StoreCommand,
 };
 
 fn main() {
@@ -105,6 +113,14 @@ enum Command {
     Gc(GcCommand),
     /// Dump the store to a directory.
     Export(ExportCommand),
+    /// Fold the store's changes into its search index.
+    Index(IndexCommand),
+    /// Search the store's items with a query.
+    Search(SearchCommand),
+    /// Count the items a query matches.
+    Count(CountCommand),
+    /// Show one item as the search index reads it.
+    Show(ShowCommand),
     #[command(alias = "completions")]
     Completion(CompletionCommand),
     #[command(alias = "manuals")]
@@ -124,6 +140,10 @@ impl Command {
             Self::Check(cmd) => cmd.execute(printer, store),
             Self::Gc(cmd) => cmd.execute(printer, store),
             Self::Export(cmd) => cmd.execute(printer, store),
+            Self::Index(cmd) => cmd.execute(printer, store),
+            Self::Search(cmd) => cmd.execute(printer, store),
+            Self::Count(cmd) => cmd.execute(printer, store),
+            Self::Show(cmd) => cmd.execute(printer, store),
             Self::Completion(cmd) => cmd.execute(printer, Cli::command()),
             Self::Manual(cmd) => cmd.execute(printer, Cli::command()),
             Self::JsonSchema(cmd) => cmd.execute(printer, json_schema::schemas()),

@@ -19,6 +19,7 @@ use crate::cli::{
     gc::GcOutput,
     item::{ItemExportOutput, ItemPurgeOutput, ItemRestoreOutput, ItemShowOutput, ItemsOutput},
     queue::{QueueCancelOutput, QueueOutput},
+    search::{CountOutput, IndexOutput, QueryErrorOutput, SearchOutput, ShowOutput},
     store::StoreInfoOutput,
 };
 
@@ -49,6 +50,11 @@ pub fn schemas() -> BTreeMap<String, Value> {
     insert!("pimdir-check", CheckOutput);
     insert!("pimdir-gc", GcOutput);
     insert!("pimdir-export", ExportOutput);
+    insert!("pimdir-index", IndexOutput);
+    insert!("pimdir-search", SearchOutput);
+    insert!("pimdir-count", CountOutput);
+    insert!("pimdir-show", ShowOutput);
+    insert!("pimdir-query-error", QueryErrorOutput);
 
     schemas
 }

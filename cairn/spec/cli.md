@@ -13,12 +13,12 @@ its own.
 
 ### Requirement: The CLI is an operator tool, never a client
 The `pimdir` binary SHALL be to a store what `sqlite3` is to a database: an
-inspection, repair and recovery tool. It SHALL NOT interpret item content. It
+inspection, repair and recovery tool. It SHALL never render item content. It
 prints `seq`, `link_id`, flags, level, the object hash and the summary row
 as stored (its columns and its address rows), and exports bodies as raw bytes. Rendering a message, a vCard or an
 event is a per-kind consumer's job (himalaya, cardamum), never this tool's,
 because a pimdir store is kind-agnostic and one binary cannot render every kind
-it may hold.
+it may hold. The search verbs read content as pimdir SEARCH.md §6 extracts it, which is the spec's rule and not this tool's opinion, and print what extraction gives (fields, chunks, a passage of text) without rendering it.
 
 ### Requirement: The CLI ships behind a feature and never reaches library consumers
 The binary SHALL be declared with `required-features = ["cli"]`, and the `cli`
@@ -136,6 +136,7 @@ The CLI SHALL expose, at minimum:
 - `gc`: reclaim the object rows nothing references, their bodies, and the orphan
   blob files a crash left, reporting what it freed.
 - `export`: a portable dump of the store.
+- `index` folds the store's change feed into index.db; `search` and `count` answer a SEARCH.md §8 query, each hit addressed as `(account, seq)` with its placements, what it matched (`body`, `summary` or none) and a snippet, every answer with its coverage, after refreshing the index within `--refresh-timeout`; `show SEQ --account ACCOUNT` prints a hit's item as extraction reads it. A refused query prints SEARCH §8.4's refusal object (`pimdir-query-error` in `json-schema`) and exits with status 1.
 
 Every command SHALL render as JSON under `--json`, write logs to stderr only,
 and carry its own `--help` text. The one carve-out is `item export` to stdout, whose output is the body's raw bytes: it SHALL refuse `--json` unless `--output` names a file, and then reports the write as JSON.

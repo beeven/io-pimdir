@@ -47,6 +47,15 @@
 //! the staging lock, and readers that take no lock. The `pimdir` binary
 //! (feature `cli`) is the operator tool over it.
 //!
+//! ## Search
+//!
+//! [`search`](mod@search) holds what a search answers about what it
+//! could not see, which the store's own reads answer too, and behind the
+//! `search` feature the query language of SEARCH.md parsed to an AST and
+//! the chunk boundaries of an indexed body. The index itself, index.db
+//! beside the store and its refresh from the change feed, is
+//! `client::search` (feature `search`).
+//!
 //! ## Conventions
 //!
 //! The crate is `no_std` with `alloc`; `std` enters behind `client`.
@@ -107,6 +116,7 @@ pub mod placement;
 pub mod reference;
 pub mod rekey;
 pub mod remote;
+pub mod search;
 pub mod sql;
 pub mod summary;
 pub mod sync;
