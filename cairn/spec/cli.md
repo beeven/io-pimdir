@@ -144,6 +144,14 @@ and carry its own `--help` text. The one carve-out is `item export` to stdout, w
 ### Requirement: The JSON output is a contract
 Every data command SHALL hand the printer one output type deriving `Display`, `Serialize` and `JsonSchema`, with camelCase keys on it and on every nested row and status enum, and a `json-schema` subcommand SHALL list every command's output type by its dash-joined path (`pimdir-item-list`), so a consumer can validate what `--json` prints. The summary row is the one value printed with the store's own column names, since it is printed as stored.
 
+### Requirement: The JSON contract is described and versioned
+`pimdir json-schema` SHALL describe, under the key `pimdir-error`, the failure object every command prints under `--json`. Every generated schema SHALL carry an `$id` naming the contract version, which is the minor version while pimdir is below 1.0 (`v0.8`) and the major version after. Every registered payload SHALL be a JSON object, checked by a test. A list SHALL be printed under a key naming its rows, `collection list` printing `{"collections": [...]}`. Piped `--json` output SHALL print one value per line.
+
+#### Scenario: A caller reads a failure against its schema
+- GIVEN `pimdir json-schema pimdir-error`
+- WHEN it runs
+- THEN the schema of the JSON failure object is printed, its `$id` being `https://pimalaya.org/schemas/pimdir/v0.8/pimdir-error.json`
+
 ### Requirement: The toolkit verbs are singular
 `completion`, `manual` and `json-schema` SHALL be spelled singular, each with its plural as a hidden alias, as every Pimalaya CLI spells them.
 

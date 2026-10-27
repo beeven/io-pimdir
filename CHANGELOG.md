@@ -31,6 +31,8 @@ All notable changes to this project are documented in this file. The format is b
 ### Changed
 
 - Changed `PimdirWriteOp::SetRoundCursor::cursor` to an `Option<PimdirCursor>`, `None` keeping the cursor a page landed, and the vendored `set_round_cursor` to coalesce it (pimdir draft-04, STORAGE §10). Added `PimdirListing::Head` and two `PimdirEnumerated` variants, which an exhaustive match must now handle. **Breaking.**
+- Changed piped `--json` output of `pimdir` to print one value per line, each schema of `json-schema` to carry an `$id` naming the contract version (`v0.8`), and added `pimdir-error`, the schema of the JSON failure object (pimalaya-cli `55b6693`).
+- Changed `pimdir collection list --json` to print `{"collections": [...]}` instead of a bare array, so every payload is a JSON object (breaking).
 
 ### Fixed
 

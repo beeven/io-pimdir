@@ -71,7 +71,7 @@ impl CollectionListCommand {
             });
         }
 
-        printer.out(CollectionsOutput(rows))
+        printer.out(CollectionsOutput { collections: rows })
     }
 }
 
@@ -125,12 +125,15 @@ impl CollectionRow {
 
 /// The `collection list` output.
 #[derive(Debug, Serialize, JsonSchema)]
-#[serde(transparent)]
-pub struct CollectionsOutput(pub Vec<CollectionRow>);
+#[serde(rename_all = "camelCase")]
+pub struct CollectionsOutput {
+    /// The collections.
+    pub collections: Vec<CollectionRow>,
+}
 
 impl fmt::Display for CollectionsOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0.is_empty() {
+        if self.collections.is_empty() {
             return writeln!(f, "This store holds no collection yet");
         }
 
@@ -149,7 +152,7 @@ impl fmt::Display for CollectionsOutput {
                 Cell::new("RETAINED"),
             ]);
 
-        for row in &self.0 {
+        for row in &self.collections {
             table.add_row(vec![
                 Cell::new(&row.id),
                 Cell::new(or_dash(Some(row.kind.as_str()).filter(|k| !k.is_empty()))),

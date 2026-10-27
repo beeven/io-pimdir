@@ -3,14 +3,15 @@
 //! Maps a command's dash-joined path, prefixed `pimdir-`, to the JSON
 //! Schema of its `--json` output. [`JsonSchemaCommand`] writes one file
 //! per entry, so the map is the CLI's machine-readable contract: one
-//! entry per data command, none for the toolkit verbs.
+//! entry per data command, none for the toolkit verbs, and `pimdir-error`
+//! for the failure object every command prints instead.
 //!
 //! [`JsonSchemaCommand`]: pimalaya_cli::clap::commands::JsonSchemaCommand
 
 use std::collections::BTreeMap;
 
+use pimalaya_cli::{clap::commands::JsonSchemaRegistry, error::ErrorReport};
 use schemars::schema_for;
-use serde_json::Value;
 
 use crate::cli::{
     check::CheckOutput,
@@ -23,10 +24,11 @@ use crate::cli::{
     store::StoreInfoOutput,
 };
 
-/// Builds the command-to-schema map consumed by `json-schema`.
+/// Builds the command-to-schema registry consumed by `json-schema`.
 ///
-/// Each value describes the type the command hands to the printer.
-pub fn schemas() -> BTreeMap<String, Value> {
+/// Each value describes the type the command hands to the printer, and
+/// `pimdir-error` the failure object every command prints instead.
+pub fn registry() -> JsonSchemaRegistry {
     let mut schemas = BTreeMap::new();
 
     macro_rules! insert {
@@ -55,6 +57,19 @@ pub fn schemas() -> BTreeMap<String, Value> {
     insert!("pimdir-count", CountOutput);
     insert!("pimdir-show", ShowOutput);
     insert!("pimdir-query-error", QueryErrorOutput);
+    insert!("pimdir-error", ErrorReport);
 
-    schemas
+    JsonSchemaRegistry {
+        bin: "pimdir",
+        version: env!("CARGO_PKG_VERSION"),
+        schemas,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_payload_is_an_object() {
+        assert_eq!(super::registry().non_object_roots(), Vec::<&str>::new());
+    }
 }
