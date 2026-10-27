@@ -105,6 +105,10 @@ fn columns(summary: &PimdirSummary) -> (&'static str, Map<String, Value>) {
             put("percent", json!(task.percent));
             put("recurring", json!(task.recurring.map(i64::from)));
             put("until", json!(task.until));
+            put("priority", json!(task.priority));
+            put("categories", json!(task.categories));
+            put("parent", json!(task.parent));
+            put("mid", json!(task.mid));
             "task_summary"
         }
         PimdirSummary::Journal(journal) => {

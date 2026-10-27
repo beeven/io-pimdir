@@ -56,6 +56,9 @@ pub const FIELDS: &[&str] = &[
     "flag",
     "has",
     "kind",
+    "status",
+    "priority",
+    "category",
     "account",
     "collection",
     "folder",
@@ -103,6 +106,12 @@ const IS_VALUES: &[&str] = &[
 
 /// `has-value` (SEARCH §8.3).
 const HAS_VALUES: &[&str] = &["body", "attachment"];
+
+/// `status-value` (SEARCH §8.3): RFC 5545's `VTODO` set, lowercased.
+const STATUS_VALUES: &[&str] = &["needs-action", "in-process", "completed", "cancelled"];
+
+/// `priority-value` (SEARCH §8.3).
+const PRIORITY_VALUES: &[&str] = &["high", "medium", "low", "none"];
 
 /// The forms of `date-value` (SEARCH §8.3).
 const DATE_FORMS: &[&str] = &[
@@ -225,6 +234,12 @@ pub enum PimdirQueryPredicate {
     HasAttachment,
     /// One kind (`kind:`).
     Kind(PimdirQueryKind),
+    /// A task's `STATUS`, uppercased as the summary holds it (`status:`).
+    Status(String),
+    /// A task's `PRIORITY` band (`priority:`).
+    Priority(PimdirQueryPriority),
+    /// One of a task's `CATEGORIES`, whole, as written (`category:`).
+    Category(String),
     /// One account (`account:`).
     Account(String),
     /// One collection, by id or by name (`collection:`, `folder:`).
@@ -275,6 +290,32 @@ pub struct PimdirQueryText {
     pub phrase: bool,
     /// Whether a trailing `*` makes it a prefix.
     pub prefix: bool,
+}
+
+/// The bands `priority:` names (SEARCH §8, RFC 5545 §3.8.1.9).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PimdirQueryPriority {
+    /// `PRIORITY` 1 to 4.
+    High,
+    /// `PRIORITY` 5.
+    Medium,
+    /// `PRIORITY` 6 to 9.
+    Low,
+    /// No `PRIORITY`, or 0.
+    None,
+}
+
+impl PimdirQueryPriority {
+    /// The band a `priority-value` names.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "high" => Some(Self::High),
+            "medium" => Some(Self::Medium),
+            "low" => Some(Self::Low),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// The kinds `kind:` names (SEARCH §8).
@@ -988,6 +1029,15 @@ fn field(
                 return Err(invalid(PimdirQueryErrorCode::InvalidValue, &kinds));
             }
         },
+        "status" => match STATUS_VALUES.contains(&value.as_str()) {
+            true => PimdirQueryPredicate::Status(value.to_uppercase()),
+            false => return Err(invalid(PimdirQueryErrorCode::InvalidValue, STATUS_VALUES)),
+        },
+        "priority" => match PimdirQueryPriority::parse(&value) {
+            Some(priority) => PimdirQueryPredicate::Priority(priority),
+            None => return Err(invalid(PimdirQueryErrorCode::InvalidValue, PRIORITY_VALUES)),
+        },
+        "category" => PimdirQueryPredicate::Category(value),
         "account" => PimdirQueryPredicate::Account(value),
         "collection" | "folder" => PimdirQueryPredicate::Collection(value),
         "date" | "when" => match date_range(&value) {
@@ -1022,7 +1072,10 @@ fn field(
 /// Whether `linked:` reads the text before a colon as a role: one pimdir
 /// gives, or an application's `x-` one.
 fn is_reference_role(role: &str) -> bool {
-    matches!(role, "attachment" | "invitation" | "sender" | "related") || role.starts_with("x-")
+    matches!(
+        role,
+        "attachment" | "invitation" | "sender" | "parent" | "source" | "related"
+    ) || role.starts_with("x-")
 }
 
 /// Reads a range of `point`s: one, or two around `..` with either side

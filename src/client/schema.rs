@@ -12,10 +12,11 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params,
 
 use crate::{
     client::{PimdirError, blobs::PimdirBlobs, busy_or_sql, rows},
+    codec,
     hash::PimdirHashAlgo,
     object::PimdirHash,
     sql,
-    summary::{PimdirSummary, mail},
+    summary::{PimdirSummary, calendar, mail},
 };
 
 /// The core tables and triggers every draft's store holds: one missing is
@@ -141,6 +142,8 @@ fn rebuild(
         .map_err(busy_or_sql)?;
     let without_invitation =
         has_table(&tx, "mail_summary")? && !has_column(&tx, "mail_summary", "invitation")?;
+    let without_organisation =
+        has_table(&tx, "task_summary")? && !has_column(&tx, "task_summary", "priority")?;
     let without_shared_object =
         has_table(&tx, "bindings")? && !has_column(&tx, "bindings", "shared_object")?;
     let pointers = ["objects", "items", "bindings", "queue"];
@@ -235,6 +238,9 @@ fn rebuild(
     if without_invitation {
         backfill_invitation(&tx, blobs)?;
     }
+    if without_organisation {
+        backfill_organisation(&tx, blobs)?;
+    }
 
     let dangling = tx
         .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
@@ -286,6 +292,60 @@ fn backfill_invitation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), Pim
         sql::LINK_INVITATIONS_OF,
         named_params! { ":link_id": None::<String> },
     )?;
+    Ok(())
+}
+
+/// Re-derives `task_summary`'s `priority`, `categories`, `parent` and `mid`
+/// from every held task body, a page of `list_held_tasks` at a time, then
+/// records the references they imply (§6, §14.2): the four task rules run
+/// over every item of their end. A body the blob directory does not hold
+/// leaves its row empty.
+fn backfill_organisation(conn: &Connection, blobs: &PimdirBlobs) -> Result<(), PimdirError> {
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let page: Vec<(String, String, String)> = rows(
+            conn,
+            sql::LIST_HELD_TASKS,
+            named_params! {
+                ":after_collection": after.as_ref().map(|(collection, _)| collection.as_str()),
+                ":after_link_id": after.as_ref().map(|(_, link_id)| link_id.as_str()),
+                ":limit": 500,
+            },
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(3)?)),
+        )?;
+        let Some((collection, link_id, _)) = page.last() else {
+            break;
+        };
+        after = Some((collection.clone(), link_id.clone()));
+        for (collection, link_id, hash) in page {
+            let Some(body) = blobs.get(&PimdirHash(hash))? else {
+                continue;
+            };
+            let Some(PimdirSummary::Task(task)) = calendar::derive(&body).summary else {
+                continue;
+            };
+            conn.execute(
+                "UPDATE task_summary SET priority = ?3, categories = ?4, parent = ?5, mid = ?6 \
+                 WHERE collection = ?1 AND link_id = ?2",
+                params![
+                    collection,
+                    link_id,
+                    task.priority,
+                    codec::ids_to_json(&task.categories),
+                    task.parent,
+                    task.mid,
+                ],
+            )?;
+        }
+    }
+    for rule in [
+        sql::LINK_PARENTS_OF,
+        sql::LINK_SOURCES_OF,
+        sql::LINK_PARENTS_TO,
+        sql::LINK_SOURCES_TO,
+    ] {
+        conn.execute(rule, named_params! { ":link_id": None::<String> })?;
+    }
     Ok(())
 }
 

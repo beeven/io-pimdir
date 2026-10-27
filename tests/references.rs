@@ -18,7 +18,9 @@ use io_pimdir::{
     },
     reference::{PimdirEndpoint, PimdirReferenceOrigin, PimdirReferenceRole},
     summary::{
-        PimdirAddress, PimdirSummary, calendar::PimdirEventSummary, contact::PimdirContactSummary,
+        PimdirAddress, PimdirSummary,
+        calendar::{PimdirEventSummary, PimdirTaskSummary},
+        contact::PimdirContactSummary,
         mail::PimdirMailSummary,
     },
 };
@@ -460,5 +462,164 @@ fn a_rule_links_at_the_write_and_never_recomputes() {
             ("dave".into(), "sender".into()),
             ("ev2".into(), "invitation".into())
         ]
+    );
+}
+
+/// A task refers to the calendar item its parent names and to the mail
+/// its mid names (STORAGE §14.2), whichever end lands first: the project
+/// before the task, the mail after it.
+#[test]
+fn a_task_refers_to_its_project_and_its_mail() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seeded(dir.path());
+    store.ensure_collection("Cal", "text/calendar").unwrap();
+    let summarised = |collection: &str, handle: &str, link: &str, summary: PimdirSummary| {
+        PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+            summary: Some(summary),
+            ..placement(collection, handle, link)
+        })
+    };
+    let task = |uid: &str, parent: Option<&str>, mid: Option<&str>| {
+        PimdirSummary::Task(PimdirTaskSummary {
+            uid: Some(uid.into()),
+            summary: uid.into(),
+            parent: parent.map(Into::into),
+            mid: mid.map(Into::into),
+            ..Default::default()
+        })
+    };
+
+    store
+        .write(vec![summarised(
+            "Cal",
+            "p",
+            "proj",
+            task("proj", None, None),
+        )])
+        .unwrap();
+    store
+        .write(vec![summarised(
+            "Cal",
+            "t",
+            "call",
+            task("call", Some("proj"), Some("limit@bank.example")),
+        )])
+        .unwrap();
+    store
+        .write(vec![summarised(
+            "INBOX",
+            "8",
+            "limit@bank.example",
+            PimdirSummary::Mail(PimdirMailSummary {
+                subject: "Your card limit".into(),
+                ..Default::default()
+            }),
+        )])
+        .unwrap();
+
+    let read: Vec<(String, String, String)> = store
+        .references_from(&endpoint("text/calendar", "call"))
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.to.kind, r.to.link_id.0, r.role.as_str().to_string()))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (MAIL.into(), "limit@bank.example".into(), "source".into()),
+            ("text/calendar".into(), "proj".into(), "parent".into()),
+        ],
+        "the project held before the task, the mail synced after it"
+    );
+    assert!(
+        store
+            .references_from(&endpoint("text/calendar", "proj"))
+            .unwrap()
+            .is_empty(),
+        "a project names no parent"
+    );
+}
+
+/// A store whose tasks predate their organisation gains the columns on
+/// open, re-derived from the held bodies, and the references they imply
+/// (STORAGE §6).
+#[test]
+fn an_earlier_store_derives_its_tasks_organisation_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seeded(dir.path());
+    store.ensure_collection("Cal", "text/calendar").unwrap();
+    let body = b"BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:call\r\nSUMMARY:Call\r\n\
+PRIORITY:1\r\nCATEGORIES:@phone,Errands\\, small\r\nRELATED-TO:proj\r\n\
+ATTACH:mid:m\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+    store
+        .write(vec![
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: PimdirHash("taskbody".into()),
+                    size: body.len() as _,
+                },
+                body: Some(body.to_vec()),
+            },
+            PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                object: Some(PimdirHash("taskbody".into())),
+                base: None,
+                summary: io_pimdir::summary::derive("text/calendar", body).and_then(|d| d.summary),
+                ..placement("Cal", "t", "call")
+            }),
+            PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                summary: Some(PimdirSummary::Task(PimdirTaskSummary {
+                    uid: Some("proj".into()),
+                    summary: "Project".into(),
+                    ..Default::default()
+                })),
+                ..placement("Cal", "p", "proj")
+            }),
+        ])
+        .unwrap();
+    drop(store);
+
+    let conn = rusqlite::Connection::open(dir.path().join("pimdir.db")).unwrap();
+    conn.execute_batch(
+        "DELETE FROM item_reference;
+         DROP INDEX task_summary_by_parent;
+         DROP INDEX task_summary_by_mid;
+         ALTER TABLE task_summary DROP COLUMN priority;
+         ALTER TABLE task_summary DROP COLUMN categories;
+         ALTER TABLE task_summary DROP COLUMN parent;
+         ALTER TABLE task_summary DROP COLUMN mid;",
+    )
+    .unwrap();
+
+    let store = PimdirStore::open(dir.path()).unwrap();
+    let row: (Option<i64>, String, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT priority, categories, parent, mid FROM task_summary WHERE link_id = 'call'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            Some(1),
+            r#"["@phone","Errands, small"]"#.into(),
+            Some("proj".into()),
+            Some("m".into())
+        ),
+        "the columns re-derived from the held body"
+    );
+    let read: Vec<(String, String)> = store
+        .references_from(&endpoint("text/calendar", "call"))
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.to.link_id.0, r.role.as_str().to_string()))
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("m".into(), "source".into()),
+            ("proj".into(), "parent".into())
+        ],
+        "the references the columns imply, backfilled"
     );
 }

@@ -44,8 +44,8 @@ use std::{
 use fs4::FileExt;
 use log::{debug, trace};
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, named_params,
-    params_from_iter,
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior,
+    functions::FunctionFlags, named_params, params_from_iter,
 };
 
 use crate::{
@@ -1104,6 +1104,16 @@ fn connect(dir: &Path) -> Result<Connection, PimdirError> {
     conn.execute(
         "ATTACH DATABASE ?1 AS store",
         [format!("file:{}?mode=ro", uri_path(&store))],
+    )?;
+    conn.create_scalar_function(
+        compile::FOLD,
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            Ok(ctx
+                .get::<Option<String>>(0)?
+                .map(|value| compile::fold(&value)))
+        },
     )?;
     Ok(conn)
 }

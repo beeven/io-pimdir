@@ -46,3 +46,9 @@ The refresh SHALL relink the messages a batch touched (SEARCH §9): the parent f
 
 ### Requirement: An item's thread is answered from the index
 `PimdirIndex::thread(account, seq)` SHALL answer the item's thread through `thread_of` and `thread_members`, members oldest first, with its id, count, first and last; an item that is not mail, or not threaded, answers itself alone; none when no live placement of it is in the account.
+
+### Requirement: Tasks are searched by status, priority and category
+`status:`, `priority:` and `category:` SHALL be parsed (`PimdirQueryPredicate::Status`, `Priority` with `PimdirQueryPriority`, `Category`) and compiled to `store.task_summary` (SEARCH §8): `status:` RFC 5545's `VTODO` set, lowercased, against the uppercased column; `priority:` `high` 1 to 4, `medium` 5, `low` 6 to 9, `none` absent or 0; `category:` one value whole, both sides folded as STORAGE Annex A.2 folds `fn` (the Unicode default full lowercase mapping, then trimmed), the stored side by the scalar function `pimdir_fold` every search connection registers, SQLite's `lower()` folding ASCII alone. The first two refuse any other value as `invalid-value`, and `category:` takes no wildcard.
+
+#### Scenario: The task vectors
+- tests/search.rs, the eleven cases over item 16 of pimdir vectors/search/queries.json; the unit test `a_category_folds_by_the_full_unicode_lowercase_mapping` of src/client/search/compile.rs.

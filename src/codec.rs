@@ -40,7 +40,8 @@ pub fn flags_from_json(json: Option<&str>) -> PimdirFlags {
     }
 }
 
-/// A list of ids as the JSON array column `in_reply_to` holds.
+/// A list of ids, or of values, as the JSON array columns `in_reply_to` and
+/// `categories` hold.
 pub fn ids_to_json(ids: &[String]) -> String {
     serde_json::to_string(ids).unwrap_or_else(|_| String::from("[]"))
 }

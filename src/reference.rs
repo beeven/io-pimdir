@@ -30,6 +30,10 @@ pub enum PimdirReferenceRole {
     Invitation,
     /// A message and the contact who sent it.
     Sender,
+    /// A task and the calendar item that is its project.
+    Parent,
+    /// A task and the message it was made from.
+    Source,
     /// Two items a person or an application relates.
     Related,
     /// An application's own role: the whole name, `x-` included, which
@@ -44,6 +48,8 @@ impl PimdirReferenceRole {
             Self::Attachment => "attachment",
             Self::Invitation => "invitation",
             Self::Sender => "sender",
+            Self::Parent => "parent",
+            Self::Source => "source",
             Self::Related => "related",
             Self::Application(name) => name,
         }
@@ -56,6 +62,8 @@ impl PimdirReferenceRole {
             "attachment" => Self::Attachment,
             "invitation" => Self::Invitation,
             "sender" => Self::Sender,
+            "parent" => Self::Parent,
+            "source" => Self::Source,
             "related" => Self::Related,
             name => Self::Application(name.into()),
         }

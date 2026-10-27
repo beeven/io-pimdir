@@ -45,3 +45,9 @@ The walk of a message's parts SHALL open multipart bodies down to `summary::mail
 
 #### Scenario: Streamed or whole, alike
 - tests/walk_agrees.rs: a table of encodings, foldings, nestings and truncations, and a property over built messages fed whole, by 1, 7 and 64 KiB octets and cut anywhere.
+
+### Requirement: A task carries its organisation
+A `VTODO` summary SHALL carry the four columns pimdir STORAGE Annex A.4 reads without the body: `priority`, `PRIORITY` 0 to 9, `None` when absent or out of range; `categories`, every `CATEGORIES` value in document order, each property's list split on the commas no backslash escapes, unescaped, empty values dropped; `parent`, the first `RELATED-TO` whose `RELTYPE` is `PARENT` or absent, verbatim; `mid`, the message id of the first `ATTACH` or `URL` holding a `mid:` URI, before any `/`, percent-decoded. An `X-` property is left in the body. The store writes `categories` as a JSON array, and the readers and the CLI's summary output carry all four.
+
+#### Scenario: The organised task vector
+- tests/summaries.rs, the case "todo, organised" of pimdir vectors/summaries.json; the unit test `a_task_reads_its_organisation_on_annex_a4s_edges` of src/summary/calendar.rs (a priority out of range, an escaped comma, a `CHILD` relation skipped, a `mid:` URI with a part).

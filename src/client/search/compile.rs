@@ -22,12 +22,22 @@ use crate::{
     client::search::PimdirSearchSort,
     search::query::{
         PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryDateUnit, PimdirQueryId,
-        PimdirQueryKind, PimdirQueryPredicate, PimdirQueryTerm, PimdirQueryText,
-        PimdirQueryTextField,
+        PimdirQueryKind, PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm,
+        PimdirQueryText, PimdirQueryTextField,
     },
     sql::{self, search},
     summary::{file, time},
 };
+
+/// The SQL function folding a stored value as [`fold`] folds a query's,
+/// registered on every search connection.
+pub(crate) const FOLD: &str = "pimdir_fold";
+
+/// A value folded as STORAGE Annex A.2 folds `fn`: the Unicode default
+/// full lowercase mapping, locale-independent, then trimmed.
+pub(crate) fn fold(value: &str) -> String {
+    value.to_lowercase().trim().to_string()
+}
 
 /// The items each `linked:` term names, as `(kind, link id)` pairs per
 /// named id (STORAGE §14.2).
@@ -301,6 +311,37 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                     format!("SELECT i.collection, i.seq {live} AND c.kind = {kind}")
                 }
             },
+            PimdirQueryPredicate::Status(status) => {
+                let status = self.bind(status.clone().into());
+                format!(
+                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                     WHERE s.collection = i.collection AND s.link_id = i.link_id \
+                     AND s.status = {status})"
+                )
+            }
+            PimdirQueryPredicate::Priority(priority) => {
+                let band = match priority {
+                    PimdirQueryPriority::High => "s.priority BETWEEN 1 AND 4",
+                    PimdirQueryPriority::Medium => "s.priority = 5",
+                    PimdirQueryPriority::Low => "s.priority BETWEEN 6 AND 9",
+                    PimdirQueryPriority::None => "ifnull(s.priority, 0) = 0",
+                };
+                format!(
+                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                     WHERE s.collection = i.collection AND s.link_id = i.link_id AND {band})"
+                )
+            }
+            PimdirQueryPredicate::Category(category) => {
+                // NOTE: both sides folded as STORAGE Annex A.2 folds `fn`,
+                // the stored side by the function the connection registers.
+                let category = self.bind(fold(category).into());
+                format!(
+                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                     JOIN json_each(s.categories) j \
+                     WHERE s.collection = i.collection AND s.link_id = i.link_id \
+                     AND {FOLD}(j.value) = {category})"
+                )
+            }
             PimdirQueryPredicate::Account(account) => {
                 return format!("(akey = {})", self.bind(account.clone().into()));
             }
@@ -592,6 +633,12 @@ mod tests {
         search::query::{PimdirQueryPredicate, PimdirQueryTerm},
         summary::time,
     };
+
+    #[test]
+    fn a_category_folds_by_the_full_unicode_lowercase_mapping() {
+        assert_eq!(fold(" ÉCOLE "), "école");
+        assert_eq!(fold("İ"), "i\u{307}");
+    }
 
     fn bounds_of(value: &str, now: i64) -> (Option<String>, Option<String>) {
         match PimdirQuery::parse(&format!("date:{value}")).unwrap() {

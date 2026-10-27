@@ -91,6 +91,10 @@ fn row(summary: &PimdirSummary) -> (&'static str, Value) {
                     "percent": task.percent,
                     "recurring": flag(task.recurring),
                     "until": task.until,
+                    "priority": task.priority,
+                    "categories": task.categories,
+                    "parent": task.parent,
+                    "mid": task.mid,
                 }),
             )
         }

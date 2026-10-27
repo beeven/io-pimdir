@@ -20,7 +20,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["client", "vendored"]
 client = ["dep:fs4", "dep:rusqlite"]
-search = ["client", "dep:ical-rs", "dep:mail-parser", "dep:vcard-rs"]
+search = ["client", "rusqlite/functions", "dep:ical-rs", "dep:mail-parser", "dep:vcard-rs"]
 cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars"]
 vendored = ["rusqlite?/bundled"]
 

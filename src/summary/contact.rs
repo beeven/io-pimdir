@@ -165,6 +165,12 @@ fn split_unquoted(text: &str, separator: char) -> Vec<&str> {
 /// A structured value's components, split on the semicolons no
 /// backslash escapes (RFC 6350 §3.3).
 pub(crate) fn components(value: &str) -> Vec<&str> {
+    split_unescaped(value, ';')
+}
+
+/// A value split on the separators no backslash escapes: a structured
+/// value's components, or a list's values (RFC 5545 §3.1.1).
+pub(crate) fn split_unescaped(value: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let mut start = 0;
     let mut escaped = false;
@@ -172,7 +178,7 @@ pub(crate) fn components(value: &str) -> Vec<&str> {
     for (at, char) in value.char_indices() {
         match (escaped, char) {
             (false, '\\') => escaped = true,
-            (false, ';') => {
+            (false, char) if char == separator => {
                 parts.push(&value[start..at]);
                 start = at + 1;
             }

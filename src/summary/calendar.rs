@@ -16,7 +16,7 @@ use crate::{
     placement::{PimdirLinkId, PimdirSortKey},
     summary::{
         PimdirAddress, PimdirDerivation, PimdirSummary,
-        contact::{PimdirContentLine, unescape},
+        contact::{PimdirContentLine, split_unescaped, unescape},
         hash_key, time, unfold,
     },
 };
@@ -83,6 +83,14 @@ pub struct PimdirTaskSummary {
     pub recurring: Option<bool>,
     /// The `RRULE`'s `UNTIL` verbatim.
     pub until: Option<String>,
+    /// The `PRIORITY`, 0 to 9; `None` when absent or out of range.
+    pub priority: Option<i64>,
+    /// Every `CATEGORIES` value in document order, decoded.
+    pub categories: Vec<String>,
+    /// The first `RELATED-TO` of type `PARENT`, or of no type, verbatim.
+    pub parent: Option<String>,
+    /// The message id the first `mid:` URI of an `ATTACH` or `URL` names.
+    pub mid: Option<String>,
     /// The `ORGANIZER`.
     pub organizer: Option<PimdirAddress>,
     /// Every `ATTENDEE`, in document order.
@@ -189,6 +197,13 @@ pub fn derive(body: &[u8]) -> PimdirDerivation {
                         .and_then(|percent| percent.trim().parse().ok()),
                     recurring,
                     until,
+                    priority: master
+                        .value("PRIORITY")
+                        .and_then(|priority| priority.trim().parse().ok())
+                        .filter(|priority| (0..=9).contains(priority)),
+                    categories: categories(master),
+                    parent: parent(master),
+                    mid: mid(master),
                     organizer,
                     attendees,
                 }),
@@ -232,6 +247,74 @@ fn person(line: &PimdirContentLine) -> PimdirAddress {
         address: PimdirAddress::canonical(&line.value),
         name: line.param("CN").map(unescape),
     }
+}
+
+/// Every `CATEGORIES` value in document order: each property's list split
+/// on the commas no backslash escapes, decoded, empty values dropped.
+fn categories(master: &Component) -> Vec<String> {
+    master
+        .lines
+        .iter()
+        .filter(|line| line.is("CATEGORIES"))
+        .flat_map(|line| split_unescaped(&line.value, ','))
+        .map(unescape)
+        .filter(|category| !category.is_empty())
+        .collect()
+}
+
+/// The first `RELATED-TO` naming a parent: of type `PARENT`, or of no type,
+/// RFC 5545 §3.2.15's default.
+fn parent(master: &Component) -> Option<String> {
+    master
+        .lines
+        .iter()
+        .filter(|line| line.is("RELATED-TO"))
+        .find(|line| {
+            line.param("RELTYPE")
+                .is_none_or(|reltype| reltype.eq_ignore_ascii_case("PARENT"))
+        })
+        .map(|line| line.value.clone())
+}
+
+/// The message the first `mid:` URI (RFC 2392) of an `ATTACH` or `URL`
+/// names: its message-id part, before any `/`, percent-decoded.
+fn mid(master: &Component) -> Option<String> {
+    let uri = master.lines.iter().find_map(|line| {
+        if !line.is("ATTACH") && !line.is("URL") {
+            return None;
+        }
+        let scheme = line.value.get(..4)?;
+        scheme
+            .eq_ignore_ascii_case("mid:")
+            .then(|| &line.value[4..])
+    })?;
+    let id = uri.split('/').next().unwrap_or_default();
+    Some(percent_decoded(id))
+}
+
+/// A URI part with its `%XX` escapes decoded (RFC 3986 §2.1); an escape
+/// that is not one is kept as written.
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let escape = (bytes[at] == b'%')
+            .then(|| text.get(at + 1..at + 3))
+            .flatten()
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escape {
+            Some(byte) => {
+                out.push(byte);
+                at += 3;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The component a summary describes: the first `VEVENT`, `VTODO` or
@@ -630,6 +713,21 @@ mod tests {
     use super::*;
 
     const EVENT: &[u8] = b"BEGIN:VCALENDAR\r\nBEGIN:VTIMEZONE\r\nTZID:Europe/Paris\r\nBEGIN:STANDARD\r\nDTSTART:19701025T030000\r\nRRULE:FREQ=YEARLY;BYMONTH=10;BYDAY=-1SU\r\nTZOFFSETFROM:+0200\r\nTZOFFSETTO:+0100\r\nEND:STANDARD\r\nBEGIN:DAYLIGHT\r\nDTSTART:19700329T020000\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=-1SU\r\nTZOFFSETFROM:+0100\r\nTZOFFSETTO:+0200\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\nBEGIN:VEVENT\r\nUID:e1\r\nSUMMARY:Stand\\, up\r\nDTSTART;TZID=Europe/Paris:20260801T120000\r\nDTEND;TZID=Europe/Paris:20260801T123000\r\nORGANIZER;CN=\"Alice, A.\":mailto:Alice@Example.org\r\nATTENDEE:mailto:bob@example.org\r\nRRULE:FREQ=WEEKLY;UNTIL=20261231T000000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+    #[test]
+    fn a_task_reads_its_organisation_on_annex_a4s_edges() {
+        let body = b"BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t\r\nPRIORITY:12\r\n\
+CATEGORIES:,a\\,b,\r\nRELATED-TO;RELTYPE=CHILD:c\r\nRELATED-TO;RELTYPE=parent:p\r\n\
+URL:MID:x%2Fy%40h/part%zz\r\nATTACH:mid:z\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+        let Some(PimdirSummary::Task(task)) = derive(body).summary else {
+            panic!("a task summary");
+        };
+        assert_eq!(task.priority, None, "out of range");
+        assert_eq!(task.categories, ["a,b"], "empty values dropped");
+        assert_eq!(task.parent.as_deref(), Some("p"), "a CHILD skipped");
+        assert_eq!(task.mid.as_deref(), Some("x/y@h"), "the id before the part");
+        assert_eq!(percent_decoded("a%zz%4"), "a%zz%4", "no escape kept");
+    }
 
     #[test]
     fn an_event_resolves_its_zoned_start_and_reads_its_people() {

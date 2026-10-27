@@ -866,6 +866,12 @@ impl PimdirSummaryTable {
                     percent: row.get(at + 10)?,
                     recurring: flag(11)?,
                     until: text(12)?,
+                    priority: row.get(at + 13)?,
+                    categories: text(14)?
+                        .map(|values| codec::ids_from_json(&values))
+                        .unwrap_or_default(),
+                    parent: text(15)?,
+                    mid: text(16)?,
                     organizer: None,
                     attendees: Vec::new(),
                 })
@@ -1261,9 +1267,10 @@ fn update_item(
 }
 
 /// Records the automatic references a written summary reads (§14.2):
-/// a mail's senders and invitation, the mail from a contact's addresses,
-/// the invitations to a calendar item. Each statement records nothing
-/// twice and never touches a person's reference.
+/// a mail's senders and invitation and the tasks made from it, the mail
+/// from a contact's addresses, the invitations to a calendar item and the
+/// tasks naming it their parent, a task's parent and source mail. Each
+/// statement records nothing twice and never touches a person's reference.
 fn link_references(
     conn: &Connection,
     link: &PimdirLinkId,
@@ -1276,12 +1283,22 @@ fn link_references(
             if mail.invitation.is_some() {
                 conn.execute(sql::LINK_INVITATIONS_OF, key)?;
             }
+            conn.execute(sql::LINK_SOURCES_TO, key)?;
         }
         Some(PimdirSummary::Contact(_)) => {
             conn.execute(sql::LINK_MAIL_FROM, key)?;
         }
         Some(PimdirSummary::Event(_) | PimdirSummary::Task(_) | PimdirSummary::Journal(_)) => {
             conn.execute(sql::LINK_INVITATIONS_TO, key)?;
+            conn.execute(sql::LINK_PARENTS_TO, key)?;
+            if let Some(PimdirSummary::Task(task)) = summary {
+                if task.parent.is_some() {
+                    conn.execute(sql::LINK_PARENTS_OF, key)?;
+                }
+                if task.mid.is_some() {
+                    conn.execute(sql::LINK_SOURCES_OF, key)?;
+                }
+            }
         }
         Some(PimdirSummary::File(_)) | None => {}
     }
@@ -1377,6 +1394,10 @@ fn write_summary(
                 ":percent": task.percent,
                 ":recurring": task.recurring.map(i64::from),
                 ":until": task.until,
+                ":priority": task.priority,
+                ":categories": codec::ids_to_json(&task.categories),
+                ":parent": task.parent,
+                ":mid": task.mid,
             },
         )?,
         PimdirSummary::Journal(journal) => conn.execute(
