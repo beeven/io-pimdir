@@ -17,12 +17,15 @@ use std::{
 };
 
 use io_pimdir::{
+    capability::{self, PimdirCapability, PimdirSupport},
     change::{PimdirDropReason, PimdirWriteOp},
     client::{
-        PimdirStore,
+        PimdirError, PimdirStore,
+        producer::PimdirProducer,
         search::{
             PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchMatched,
             PimdirSearchOptions, PimdirSearchSort,
+            tag::{PimdirSearchTagError, PimdirSearchTagPlan},
         },
     },
     collection::{PimdirCollectionId, PimdirScope},
@@ -1067,4 +1070,320 @@ fn a_deleted_member_leaves_its_thread_consistent() {
         (1, 2),
         "b stays as c's parent, a goes, named by nobody"
     );
+}
+
+/// The flags the store holds for the item `seq` in `collection`.
+fn store_flags(dir: &Path, collection: &str, seq: i64) -> Vec<String> {
+    PimdirStore::open(dir)
+        .unwrap()
+        .get_item(collection, seq)
+        .unwrap()
+        .unwrap()
+        .flags
+        .known()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect()
+}
+
+/// One message filed in `INBOX` and `Archive`, another in `INBOX`, the
+/// index refreshed; the first one's seq.
+fn tag_store(dir: &Path) -> (PimdirIndex, i64) {
+    let alpha = || mail("alpha@x", 9, "");
+    file_message(dir, "INBOX", alpha(), &["\\Seen"]);
+    file_message(dir, "Archive", alpha(), &[]);
+    file_message(dir, "INBOX", mail("beta@x", 10, ""), &[]);
+
+    let mut index = PimdirIndex::open(dir).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let seq = hits(&index, "id:alpha@x")[0];
+    (index, seq)
+}
+
+#[test]
+fn a_tag_stages_one_action_per_placement_and_a_drain_applies_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, seq) = tag_store(dir.path());
+    let query = PimdirQuery::parse("subject:alpha").unwrap();
+    let clock = PimdirSearchClock::default();
+
+    let plan = index
+        .tag(
+            &query,
+            &["flagged".into(), "work".into()],
+            &["read".into()],
+            None,
+            &clock,
+        )
+        .unwrap();
+    assert_eq!(plan.hits.len(), 1, "one hit for the message in two folders");
+    let next: Vec<_> = plan.hits[0]
+        .placements
+        .iter()
+        .map(|placement| {
+            (
+                placement.collection.as_str(),
+                placement.next.clone().unwrap(),
+            )
+        })
+        .collect();
+    let want: BTreeSet<String> = ["\\Flagged", "work"].map(String::from).into();
+    assert_eq!(next, [("Archive", want.clone()), ("INBOX", want.clone())]);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let actions = plan.stage(&mut producer).unwrap();
+    assert_eq!(actions.len(), 2, "one set-flags per placement");
+    assert!(
+        actions.iter().all(|action| action.source == "local"),
+        "the only source syncing each collection"
+    );
+    assert_eq!(
+        store_flags(dir.path(), "INBOX", seq),
+        ["\\Seen"],
+        "staged only"
+    );
+    drop(producer);
+
+    PimdirStore::open(dir.path())
+        .unwrap()
+        .for_source("local")
+        .drain()
+        .unwrap();
+    for collection in ["INBOX", "Archive"] {
+        assert_eq!(
+            store_flags(dir.path(), collection, seq),
+            ["\\Flagged", "work"]
+        );
+    }
+
+    let again = index
+        .tag(&query, &["work".into()], &[], None, &clock)
+        .unwrap();
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    assert!(
+        again.stage(&mut producer).unwrap().is_empty(),
+        "a placement the change leaves as it is stages nothing"
+    );
+}
+
+#[test]
+fn a_tag_refuses_a_change_naming_no_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let (index, _) = tag_store(dir.path());
+    let query = PimdirQuery::parse("alpha").unwrap();
+    let clock = PimdirSearchClock::default();
+    let refusal = |add: &[&str], remove: &[&str]| {
+        let add: Vec<String> = add.iter().map(|flag| flag.to_string()).collect();
+        let remove: Vec<String> = remove.iter().map(|flag| flag.to_string()).collect();
+        match index.tag(&query, &add, &remove, None, &clock) {
+            Err(PimdirError::Tag(err)) => err,
+            other => panic!("{add:?} {remove:?}: refused, got {other:?}"),
+        }
+    };
+
+    assert_eq!(refusal(&[], &[]), PimdirSearchTagError::Empty);
+    assert_eq!(
+        refusal(&["unread"], &[]),
+        PimdirSearchTagError::NotAFlag("unread".into())
+    );
+    assert_eq!(
+        refusal(&["read"], &["\\Seen"]),
+        PimdirSearchTagError::Both("\\Seen".into())
+    );
+}
+
+#[test]
+fn a_thread_answers_its_members_from_any_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(dir.path(), "INBOX", mail("p@x", 9, ""), &[]);
+    let reply = mail("c@x", 10, "In-Reply-To: <p@x>\r\n");
+    file_message(dir.path(), "INBOX", reply, &[]);
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("local");
+    store
+        .ensure_collection("Files", "application/octet-stream")
+        .unwrap();
+    let file = PimdirFileSummary {
+        name: "notes.txt".into(),
+        media_type: None,
+        size: None,
+        part: None,
+    };
+    store
+        .put_file("Files", &PimdirLinkId("notes".into()), &file)
+        .unwrap();
+    drop(store);
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let seq = |id: &str| hits(&index, &format!("id:{id}"))[0];
+    let (root, child, notes) = (seq("p@x"), seq("c@x"), seq("notes"));
+
+    for from in [child, root] {
+        let thread = index.thread(None, from).unwrap().unwrap();
+        let members: Vec<i64> = thread.hits.iter().map(|hit| hit.seq).collect();
+        assert_eq!(
+            (thread.thread.as_deref(), thread.count, members),
+            (Some("p@x"), 2, vec![root, child]),
+            "from {from}: oldest first"
+        );
+        assert_eq!(
+            (thread.first.as_deref(), thread.last.as_deref()),
+            (Some("2026-08-01T09:00:00Z"), Some("2026-08-01T10:00:00Z"))
+        );
+    }
+
+    let alone = index.thread(None, notes).unwrap().unwrap();
+    let members: Vec<i64> = alone.hits.iter().map(|hit| hit.seq).collect();
+    assert_eq!((alone.thread, alone.count, members), (None, 1, vec![notes]));
+    assert!(index.thread(Some("other"), root).unwrap().is_none());
+}
+
+/// Files a body into a collection of `kind` as `source`.
+fn file_as(dir: &Path, source: &str, collection: &str, kind: &str, body: Vec<u8>) {
+    let mut store = PimdirStore::open(dir).unwrap().for_source(source);
+    store.ensure_collection(collection, kind).unwrap();
+    let derived = summary::derive(kind, &body).unwrap();
+    let hash = store.hash(&body);
+    store
+        .write(vec![
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: hash.clone(),
+                    size: body.len(),
+                },
+                body: Some(body),
+            },
+            PimdirWriteOp::UpsertPlacement(placement(
+                collection,
+                derived.link_id.as_str(),
+                derived.link_id.as_str(),
+                Some(hash),
+                derived.summary.unwrap(),
+                derived.sort_key.as_str(),
+                PimdirFlags::Known(BTreeSet::new()),
+            )),
+        ])
+        .unwrap();
+}
+
+/// Declares `source` supporting every capability of `names` in full.
+fn declare(dir: &Path, source: &str, names: &[&str]) {
+    let capabilities: Vec<PimdirCapability> = names
+        .iter()
+        .map(|name| PimdirCapability {
+            collection: None,
+            name: name.to_string(),
+            support: PimdirSupport::Full,
+            detail: None,
+        })
+        .collect();
+    PimdirStore::open(dir)
+        .unwrap()
+        .declare(source, &capabilities)
+        .unwrap();
+}
+
+#[test]
+fn a_tag_says_which_placements_reach_their_server() {
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    file_as(dir, "imap", "INBOX", "message/rfc822", mail("a@x", 9, ""));
+    file_as(dir, "pop", "Local", "message/rfc822", mail("b@x", 10, ""));
+    let event = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//x//x//EN\r\nBEGIN:VEVENT\r\n\
+                 UID:standup@x\r\nDTSTAMP:20260801T000000Z\r\nDTSTART:20260801T090000Z\r\n\
+                 SUMMARY:Standup\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    file_as(dir, "caldav", "Calendar", "text/calendar", event.into());
+    declare(dir, "imap", capability::MAIL);
+    declare(dir, "pop", &[capability::MAIL_FLAGS_SEEN]);
+
+    let mut index = PimdirIndex::open(dir).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    let query = PimdirQuery::parse("kind:mail or kind:event").unwrap();
+    let plan = index
+        .tag(
+            &query,
+            &["work".into()],
+            &[],
+            None,
+            &PimdirSearchClock::default(),
+        )
+        .unwrap();
+    let reach = |plan: &PimdirSearchTagPlan| -> BTreeMap<String, (bool, Vec<String>)> {
+        plan.hits
+            .iter()
+            .flat_map(|hit| &hit.placements)
+            .map(|placement| {
+                (
+                    placement.collection.clone(),
+                    (placement.syncs, placement.missing.clone()),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        reach(&plan),
+        BTreeMap::from([
+            ("Calendar".into(), (false, vec![])),
+            ("INBOX".into(), (true, vec![])),
+            (
+                "Local".into(),
+                (false, vec![capability::MAIL_FLAGS_KEYWORDS.to_string()])
+            ),
+        ]),
+        "flags reach a server for mail alone, from a source declaring them"
+    );
+
+    let mut producer = PimdirProducer::open(dir, "test").unwrap();
+    let staged: BTreeSet<String> = plan
+        .stage(&mut producer)
+        .unwrap()
+        .into_iter()
+        .map(|action| action.collection)
+        .collect();
+    assert_eq!(
+        staged,
+        BTreeSet::from(["Calendar".into(), "INBOX".into()]),
+        "nothing for the source lacking the capability, the others staged"
+    );
+    drop(producer);
+    PimdirStore::open(dir)
+        .unwrap()
+        .for_source("imap")
+        .drain()
+        .unwrap();
+    let inbox = hits(&index, "id:a@x")[0];
+    assert_eq!(store_flags(dir, "INBOX", inbox), ["work"]);
+    let local = hits(&index, "id:b@x")[0];
+    assert!(store_flags(dir, "Local", local).is_empty());
+
+    // NOTE: a declaration changed between the plan and the stage: the
+    // gate refuses at the stage, and the queue stays as it was.
+    declare(dir, "pop", capability::MAIL);
+    let plan = index
+        .tag(
+            &PimdirQuery::parse("id:b@x").unwrap(),
+            &["late".into()],
+            &[],
+            None,
+            &PimdirSearchClock::default(),
+        )
+        .unwrap();
+    assert!(plan.hits[0].placements[0].missing.is_empty());
+    declare(dir, "pop", &[capability::MAIL_FLAGS_SEEN]);
+    let mut producer = PimdirProducer::open(dir, "test").unwrap();
+    match plan.stage(&mut producer) {
+        Err(PimdirError::Unsupported(refusal)) => assert_eq!(
+            (refusal.source.as_str(), refusal.capability.as_str()),
+            ("pop", capability::MAIL_FLAGS_KEYWORDS)
+        ),
+        other => panic!("the gate refuses the keyword on pop, got {other:?}"),
+    }
+    assert!(producer.pending_actions("Local").unwrap().is_empty());
 }

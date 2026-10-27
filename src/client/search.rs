@@ -23,6 +23,7 @@
 mod compile;
 pub mod extract;
 mod occurrence;
+pub mod tag;
 mod thread;
 
 use alloc::{
@@ -223,7 +224,8 @@ pub struct PimdirSearchThread {
     pub first: Option<String>,
     /// The latest.
     pub last: Option<String>,
-    /// The thread's hits, in the order asked.
+    /// The thread's hits: in the order asked in a listing, oldest first
+    /// from [`PimdirIndex::thread`].
     pub hits: Vec<PimdirSearchHit>,
 }
 
@@ -632,6 +634,94 @@ impl PimdirIndex {
             more,
             coverage: self.coverage(query, now)?,
         })
+    }
+
+    /// The thread of one item, `(account, seq)` (SEARCH §9): its id
+    /// (`thread_of`), count, first and last date, and its live members in
+    /// the account (`thread_members`) as hits, oldest first. An item no
+    /// thread holds, one other than mail, is its own thread as the
+    /// threaded listing answers it; `None` when no live placement of it
+    /// is in the account.
+    pub fn thread(
+        &self,
+        account: Option<&str>,
+        seq: i64,
+    ) -> Result<Option<PimdirSearchThread>, PimdirError> {
+        let (kind, _, placements) = self.placements(account, seq)?;
+        if placements.is_empty() {
+            return Ok(None);
+        }
+
+        let mut thread = None;
+        if kind == PimdirQueryKind::Mail.as_str() {
+            for placement in &placements {
+                thread = self
+                    .conn
+                    .query_row(
+                        search::THREAD_OF,
+                        named_params! { ":link_id": placement.link_id.0 },
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                if thread.is_some() {
+                    break;
+                }
+            }
+        }
+        let account = account.map(ToString::to_string);
+        let Some(thread) = thread else {
+            let found = Found {
+                account: account.clone(),
+                seq,
+                matched: None,
+            };
+            return Ok(Some(PimdirSearchThread {
+                account,
+                thread: None,
+                count: 1,
+                first: None,
+                last: None,
+                hits: vec![self.hit(found, &[])?],
+            }));
+        };
+
+        let members: BTreeSet<i64> = rows(
+            &self.conn,
+            search::THREAD_MEMBERS,
+            named_params! { ":thread": thread, ":account": account },
+            |row| row.get::<_, i64>(1),
+        )?
+        .into_iter()
+        .collect();
+        let mut hits = Vec::new();
+        for seq in members {
+            let found = Found {
+                account: account.clone(),
+                seq,
+                matched: None,
+            };
+            let hit = self.hit(found, &[])?;
+            // NOTE: a member whose placements went since the last refresh
+            // is not live any more.
+            if !hit.placements.is_empty() {
+                hits.push(hit);
+            }
+        }
+        hits.sort_by(|a, b| (&a.sort_key, a.seq).cmp(&(&b.sort_key, b.seq)));
+        let (count, first, last) = self.conn.query_row(
+            search::THREAD_SPAN,
+            named_params! { ":thread": thread, ":account": account },
+            |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
+        )?;
+
+        Ok(Some(PimdirSearchThread {
+            account,
+            thread: Some(thread),
+            count,
+            first,
+            last,
+            hits,
+        }))
     }
 
     /// How many hits a query has, with what the count could not see, its

@@ -1,5 +1,6 @@
 //! The search verbs over the store's index (pimdir SEARCH.md): `index`,
-//! `search`, `count` and `show`.
+//! `search`, `count`, `show`, `thread` and `tag`, the one that writes,
+//! through the queue.
 //!
 //! They read content as SEARCH §6 extracts it, which is the spec's rule
 //! and not this tool's opinion, and never render it: a hit prints as its
@@ -16,12 +17,12 @@ use std::{
 };
 
 use anyhow::Result;
-use clap::{Args, ValueEnum};
+use clap::{ArgGroup, Args, ValueEnum};
 use io_pimdir::{
     client::search::{
         PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchHit,
         PimdirSearchMatched, PimdirSearchOptions, PimdirSearchPlacement, PimdirSearchSort,
-        PimdirSearchThread,
+        PimdirSearchThread, tag::PimdirSearchTagSource,
     },
     placement::PimdirLevel,
     search::{
@@ -248,6 +249,222 @@ impl ShowCommand {
             },
             chunks,
         })
+    }
+}
+
+/// Add or remove flags on every item a query matches.
+///
+/// Stages one `set-flags` action per placement of each hit through the
+/// store's queue (pimdir SEARCH.md §10), as a producer, then applies them
+/// when no sync holds the store; otherwise they wait in the queue and
+/// apply at the next sync. `read`, `flagged`, `answered` and `draft` name
+/// `\Seen`, `\Flagged`, `\Answered` and `\Draft`; any other flag is
+/// written as given. `--dry-run` prints what would be staged and writes
+/// nothing.
+#[derive(Debug, Args)]
+#[command(group(ArgGroup::new("change").required(true).multiple(true).args(["add", "remove"])))]
+pub struct TagCommand {
+    /// The query, as one argument.
+    #[arg(value_name = "QUERY")]
+    pub query: String,
+
+    /// Add this flag to every hit; repeatable.
+    #[arg(long, value_name = "FLAG")]
+    pub add: Vec<String>,
+
+    /// Remove this flag from every hit; repeatable.
+    #[arg(long, value_name = "FLAG")]
+    pub remove: Vec<String>,
+
+    /// Print the hits, their placements and the flags each would carry,
+    /// and stage nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    #[command(flatten)]
+    pub refresh: RefreshFlags,
+}
+
+impl TagCommand {
+    /// Plans the tag, then stages and applies it unless dry.
+    pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
+        let query = parse(printer, &self.query)?;
+        let index = self.refresh.index(store)?;
+        let plan = index
+            .tag(
+                &query,
+                &self.add,
+                &self.remove,
+                store.source.as_deref(),
+                &PimdirSearchClock::default(),
+            )
+            .map_err(report)?;
+
+        let mut statuses = BTreeMap::new();
+        let staging = plan.hits.iter().any(|hit| {
+            hit.placements.iter().any(|placement| {
+                placement.changes()
+                    && placement.missing.is_empty()
+                    && matches!(placement.source, PimdirSearchTagSource::Resolved(_))
+            })
+        });
+        if !self.dry_run && staging {
+            let actions = plan.stage(&mut store.producer()?).map_err(report)?;
+            // NOTE: a drain is store-wide and applies each action as a
+            // source syncing its collection, the one it runs as when that
+            // one does: the source asked for, else any staged one.
+            let source = store
+                .source
+                .clone()
+                .or_else(|| actions.first().map(|action| action.source.clone()))
+                .unwrap_or_default();
+
+            // NOTE: the drain reports what it did to the whole queue, so
+            // each placement itself is the only proof its action landed:
+            // it carries the staged flags, or it does not.
+            let owner = match store.owner_if_free()? {
+                None => None,
+                Some(owner) => {
+                    let mut owner = owner.for_source(source);
+                    match owner.drain() {
+                        Err(io_pimdir::client::PimdirError::Busy) => None,
+                        Err(err) => return Err(report(err)),
+                        Ok(_) => Some(owner),
+                    }
+                }
+            };
+            for action in actions {
+                let status = match &owner {
+                    None => TagStatus::Queued,
+                    Some(owner) => {
+                        let item = owner
+                            .get_item(&action.collection, action.seq)
+                            .map_err(report)?;
+                        match item {
+                            Some(item) if item.flags.known() == Some(&action.flags) => {
+                                TagStatus::Applied
+                            }
+                            _ => TagStatus::Refused,
+                        }
+                    }
+                };
+                statuses.insert(
+                    (action.collection.clone(), action.seq),
+                    (status, action.action),
+                );
+            }
+        }
+
+        let hits = plan
+            .hits
+            .iter()
+            .map(|hit| TagHitRow {
+                account: hit.account.clone(),
+                seq: hit.seq,
+                kind: hit.kind.clone(),
+                title: hit.title.clone(),
+                placements: hit
+                    .placements
+                    .iter()
+                    .map(|placement| {
+                        let staged = statuses.get(&(placement.collection.clone(), hit.seq));
+                        let status = match (staged, &placement.next, &placement.source) {
+                            (Some((status, _)), _, _) => *status,
+                            (None, None, _) => TagStatus::UnknownFlags,
+                            (None, Some(_), _) if !placement.changes() => TagStatus::Unchanged,
+                            (None, Some(_), PimdirSearchTagSource::Ambiguous(_)) => {
+                                TagStatus::AmbiguousSource
+                            }
+                            (None, Some(_), PimdirSearchTagSource::Unsynced(_)) => {
+                                TagStatus::Unsynced
+                            }
+                            (None, Some(_), PimdirSearchTagSource::Resolved(_))
+                                if !placement.missing.is_empty() =>
+                            {
+                                TagStatus::Unsupported
+                            }
+                            (None, Some(_), PimdirSearchTagSource::Resolved(_)) => {
+                                TagStatus::Planned
+                            }
+                        };
+                        let (source, sources) = match &placement.source {
+                            PimdirSearchTagSource::Resolved(source) => {
+                                (Some(source.clone()), vec![source.clone()])
+                            }
+                            PimdirSearchTagSource::Ambiguous(sources)
+                            | PimdirSearchTagSource::Unsynced(sources) => (None, sources.clone()),
+                        };
+                        TagPlacementRow {
+                            collection: placement.collection.clone(),
+                            link_id: placement.link_id.0.clone(),
+                            flags: placement
+                                .flags
+                                .known()
+                                .map(|flags| flags.iter().cloned().collect()),
+                            next: placement
+                                .next
+                                .as_ref()
+                                .map(|flags| flags.iter().cloned().collect()),
+                            status,
+                            source,
+                            sources,
+                            syncs: placement.syncs,
+                            missing: placement.missing.clone(),
+                            action: staged.map(|(_, action)| *action),
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        printer.out(TagOutput {
+            query: self.query,
+            dry_run: self.dry_run,
+            add: plan.add.into_iter().collect(),
+            remove: plan.remove.into_iter().collect(),
+            hits,
+            coverage: CoverageRow::from(&plan.coverage),
+        })
+    }
+}
+
+/// Show the mail thread of one item.
+///
+/// Takes a hit's address, its `seq` and `--account`, and prints its
+/// thread (pimdir SEARCH.md §9): the thread id `thread:` takes, how many
+/// messages it holds in the account, its first and last date, and its
+/// members there, oldest first. An item other than mail, or a message the
+/// index has not threaded, is its own thread.
+#[derive(Debug, Args)]
+pub struct ThreadCommand {
+    /// Public id of the item (`seq`), as a hit prints it.
+    #[arg(value_name = "SEQ")]
+    pub seq: i64,
+
+    /// The account of the hit; omit it in a store of one account.
+    #[arg(long, short = 'a', value_name = "ACCOUNT")]
+    pub account: Option<String>,
+
+    #[command(flatten)]
+    pub refresh: RefreshFlags,
+}
+
+impl ThreadCommand {
+    /// Prints the thread.
+    pub fn execute(self, printer: &mut impl Printer, store: &StoreFlags) -> Result<()> {
+        let index = self.refresh.index(store)?;
+        let Some(thread) = index
+            .thread(self.account.as_deref(), self.seq)
+            .map_err(report)?
+        else {
+            anyhow::bail!(
+                "No live item {} in account {}",
+                self.seq,
+                or_dash(self.account.as_deref())
+            );
+        };
+
+        printer.out(ThreadRow::from(&thread))
     }
 }
 
@@ -495,6 +712,207 @@ impl From<&PimdirSearchThread> for ThreadRow {
             first: thread.first.clone(),
             last: thread.last.clone(),
             hits: thread.hits.iter().map(HitRow::from).collect(),
+        }
+    }
+}
+
+impl fmt::Display for ThreadRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let account = self
+            .account
+            .as_deref()
+            .map(|account| format!(" in account {account}"))
+            .unwrap_or_default();
+        match &self.thread {
+            Some(id) => writeln!(
+                f,
+                "Thread {id}{account}: {} message(s), {} to {}",
+                self.count,
+                or_dash(self.first.as_deref()),
+                or_dash(self.last.as_deref())
+            )?,
+            None => writeln!(f, "No thread{account}: the item stands alone")?,
+        }
+        for hit in &self.hits {
+            writeln!(f, " - {} {} {}", hit.seq, hit.sort_key, hit.title)?;
+        }
+        Ok(())
+    }
+}
+
+/// The `tag` output: every hit of the query, each placement with the
+/// flags it carries, the flags the tag gives it and what became of that.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TagOutput {
+    /// The query as given.
+    pub query: String,
+    /// Whether this was a `--dry-run`, which staged nothing.
+    pub dry_run: bool,
+    /// The flags added, `is:` spellings mapped to their flags.
+    pub add: Vec<String>,
+    /// The flags removed.
+    pub remove: Vec<String>,
+    /// Every hit, newest first.
+    pub hits: Vec<TagHitRow>,
+    /// What the query could not see: a tag reaches only the hits the
+    /// index answers.
+    pub coverage: CoverageRow,
+}
+
+impl fmt::Display for TagOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.hits.is_empty() {
+            writeln!(f, "No hit: nothing to tag")?;
+        }
+        let mut statuses = BTreeMap::new();
+        for hit in &self.hits {
+            writeln!(f, "{} [{}] {}", hit.seq, hit.kind, hit.title)?;
+            for placement in &hit.placements {
+                *statuses.entry(placement.status.as_str()).or_insert(0) += 1;
+                let next = placement
+                    .next
+                    .as_ref()
+                    .map(|flags| flags.join(" "))
+                    .unwrap_or_else(|| "-".into());
+                writeln!(
+                    f,
+                    " - in {}: {} ({})",
+                    placement.collection,
+                    next,
+                    placement.status.as_str()
+                )?;
+                if !placement.missing.is_empty() {
+                    writeln!(
+                        f,
+                        "   not staged: its source supports no {}",
+                        placement.missing.join(", ")
+                    )?;
+                } else if !placement.syncs && placement.source.is_some() {
+                    let why = match hit.kind.as_str() {
+                        "mail" => "its source declares no support for these flags",
+                        _ => "its source carries no flags for this kind",
+                    };
+                    writeln!(f, "   kept in the store only: {why}")?;
+                }
+            }
+        }
+        for (status, count) in &statuses {
+            writeln!(f, "{count} placement(s) {status}")?;
+        }
+        if statuses.contains_key(TagStatus::Queued.as_str()) {
+            writeln!(
+                f,
+                "Another writer holds the store lock: the queued actions apply at the next sync"
+            )?;
+        }
+        if statuses.contains_key(TagStatus::AmbiguousSource.as_str()) {
+            writeln!(
+                f,
+                "Several sources sync a collection: pick the one to write as with --source"
+            )?;
+        }
+        if statuses.contains_key(TagStatus::Refused.as_str()) {
+            writeln!(
+                f,
+                "Some actions were not applied: see `pimdir queue list --parked`"
+            )?;
+        }
+        write!(f, "{}", self.coverage)
+    }
+}
+
+/// One hit a tag reaches.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TagHitRow {
+    /// The account, `null` in a store of one account.
+    pub account: Option<String>,
+    /// The public id.
+    pub seq: i64,
+    /// The kind, as a search hit prints it.
+    pub kind: String,
+    /// Its subject, name or summary.
+    pub title: String,
+    /// Its live placements in the account.
+    pub placements: Vec<TagPlacementRow>,
+}
+
+/// One placement a tag reaches.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TagPlacementRow {
+    /// The collection.
+    pub collection: String,
+    /// The item's key there.
+    pub link_id: String,
+    /// Its flags before the tag, `null` when never read.
+    pub flags: Option<Vec<String>>,
+    /// The flags the tag gives it, `null` when its flags were never read.
+    pub next: Option<Vec<String>>,
+    /// What became of it.
+    pub status: TagStatus,
+    /// The source its action is staged as: the one asked for with
+    /// `--source`, else the only one syncing the collection; `null` when
+    /// none is.
+    pub source: Option<String>,
+    /// The sources syncing the collection: the one staging, or the
+    /// candidates of an ambiguous one, empty when none syncs it.
+    pub sources: Vec<String>,
+    /// Whether its source carries the tag to its server by the
+    /// capabilities it declares: only mail has flags there. False keeps
+    /// the tag in the store alone, whatever its status.
+    pub syncs: bool,
+    /// The capabilities the change needs that its source declares no
+    /// support for; not empty, the placement is `unsupported` and nothing
+    /// is staged for it.
+    pub missing: Vec<String>,
+    /// The queue row staged for it, `null` when none was.
+    pub action: Option<i64>,
+}
+
+/// What became of one placement a tag reaches.
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum TagStatus {
+    /// A dry run: an action would be staged.
+    Planned,
+    /// It already carries the flags: nothing staged.
+    Unchanged,
+    /// Its flags were never read, so no flag set can be staged without
+    /// losing them: nothing staged.
+    UnknownFlags,
+    /// Several sources sync its collection and `--source` picked none of
+    /// them: nothing staged, `sources` lists them.
+    AmbiguousSource,
+    /// The source asked for does not sync its collection, or none does:
+    /// nothing staged.
+    Unsynced,
+    /// Its source declares no support for a capability the change needs
+    /// (`missing`): nothing staged.
+    Unsupported,
+    /// Staged and applied: the store shows the flags.
+    Applied,
+    /// Staged while another writer holds the store lock: applies at the
+    /// next sync.
+    Queued,
+    /// Staged, drained, and the store does not show the flags: the action
+    /// was refused, see `pimdir queue list --parked`.
+    Refused,
+}
+
+impl TagStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Unchanged => "unchanged",
+            Self::UnknownFlags => "unknownFlags",
+            Self::AmbiguousSource => "ambiguousSource",
+            Self::Unsynced => "unsynced",
+            Self::Unsupported => "unsupported",
+            Self::Applied => "applied",
+            Self::Queued => "queued",
+            Self::Refused => "refused",
         }
     }
 }

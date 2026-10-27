@@ -56,7 +56,7 @@ use crate::cli::{
     item::ItemCommand,
     json_schema,
     queue::QueueCommand,
-    search::{CountCommand, IndexCommand, SearchCommand, ShowCommand},
+    search::{CountCommand, IndexCommand, SearchCommand, ShowCommand, TagCommand, ThreadCommand},
     store::StoreCommand,
 };
 
@@ -121,6 +121,10 @@ enum Command {
     Count(CountCommand),
     /// Show one item as the search index reads it.
     Show(ShowCommand),
+    /// Show the mail thread of one item.
+    Thread(ThreadCommand),
+    /// Add or remove flags on every item a query matches.
+    Tag(TagCommand),
     #[command(alias = "completions")]
     Completion(CompletionCommand),
     #[command(alias = "manuals")]
@@ -144,6 +148,8 @@ impl Command {
             Self::Search(cmd) => cmd.execute(printer, store),
             Self::Count(cmd) => cmd.execute(printer, store),
             Self::Show(cmd) => cmd.execute(printer, store),
+            Self::Thread(cmd) => cmd.execute(printer, store),
+            Self::Tag(cmd) => cmd.execute(printer, store),
             Self::Completion(cmd) => cmd.execute(printer, Cli::command()),
             Self::Manual(cmd) => cmd.execute(printer, Cli::command()),
             Self::JsonSchema(cmd) => cmd.execute(printer, json_schema::registry()),

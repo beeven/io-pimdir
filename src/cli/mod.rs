@@ -53,9 +53,10 @@ pub struct StoreFlags {
     /// Act as this source rather than the store's own.
     ///
     /// A store records one source per side it syncs with (`left`, `right`,
-    /// `phone`, …). Only a verb that writes as a side reads this flag, which
-    /// today is `item restore`: it says which source the restored item is
-    /// created for. A single-source store needs no flag.
+    /// `phone`, …). Only the verbs that write as a side read this flag:
+    /// `item restore` creates the restored item for it, and `tag` stages
+    /// only the placements of collections it syncs, picking it where several
+    /// sources sync one. A single-source store needs no flag.
     #[arg(long, global = true, value_name = "NAME")]
     pub source: Option<String>,
 }

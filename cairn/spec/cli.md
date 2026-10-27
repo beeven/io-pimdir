@@ -38,7 +38,7 @@ as it stands, and reads what is queued through `queue list`, where a pending row
 shows as a row rather than as a fact about an item.
 
 ### Requirement: Item mutations enqueue, then drain when the owner role is free
-An item mutation requested from the CLI (today: `item restore`) SHALL be
+An item mutation requested from the CLI (today: `item restore` and `tag`) SHALL be
 appended to the action queue through the producer role, exactly as any other
 non-owner process does. The CLI SHALL then attempt to take the owner role and
 drain the queue itself, store-wide in append order, reporting **applied** when the item is live again
@@ -136,7 +136,7 @@ The CLI SHALL expose, at minimum:
 - `gc`: reclaim the object rows nothing references, their bodies, and the orphan
   blob files a crash left, reporting what it freed.
 - `export`: a portable dump of the store.
-- `index` folds the store's change feed into index.db; `search` and `count` answer a SEARCH.md §8 query, each hit addressed as `(account, seq)` with its placements, what it matched (`body`, `summary` or none) and a snippet, every answer with its coverage, after refreshing the index within `--refresh-timeout`; `show SEQ --account ACCOUNT` prints a hit's item as extraction reads it. `search --threads` collapses hits to threads (`pimdir-search-threads`), `--limit` and `--offset` then counting threads. A refused query prints SEARCH §8.4's refusal object (`pimdir-query-error` in `json-schema`) and exits with status 1.
+- `index` folds the store's change feed into index.db; `search` and `count` answer a SEARCH.md §8 query, each hit addressed as `(account, seq)` with its placements, what it matched (`body`, `summary` or none) and a snippet, every answer with its coverage, after refreshing the index within `--refresh-timeout`; `show SEQ --account ACCOUNT` prints a hit's item as extraction reads it. `search --threads` collapses hits to threads (`pimdir-search-threads`), `--limit` and `--offset` then counting threads. `thread SEQ --account ACCOUNT` prints the item's thread (`pimdir-thread`). `tag QUERY --add FLAG --remove FLAG` stages one `set-flags` per placement that changes, each as the source syncing its collection, previews it with `--dry-run`, and reads each placement's outcome back from the store (`pimdir-tag`). A refused query prints SEARCH §8.4's refusal object (`pimdir-query-error` in `json-schema`) and exits with status 1.
 
 Every command SHALL render as JSON under `--json`, write logs to stderr only,
 and carry its own `--help` text. The one carve-out is `item export` to stdout, whose output is the body's raw bytes: it SHALL refuse `--json` unless `--output` names a file, and then reports the write as JSON.

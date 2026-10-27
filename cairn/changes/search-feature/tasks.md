@@ -32,7 +32,7 @@ Deferred to the 2027 NLnet plan, Task 2 "pimdir Notmuch"; the plan is pimdir cai
 
 ## M4, this crate's part
 
-- [ ] CLI `tag` through the queue; `thread`; their `--json` and JSON Schema
+- [x] CLI `tag` through the queue (`PimdirIndex::tag`, `PimdirSearchTagPlan::stage`, `--dry-run`); `thread` (`PimdirIndex::thread`); their `--json` and JSON Schema (`pimdir-tag`, `pimdir-thread`)
 
 ## Coverage
 

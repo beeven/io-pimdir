@@ -1056,6 +1056,10 @@ pub enum PimdirError {
     /// with `?`.
     #[cfg(feature = "search")]
     Query(crate::search::query::PimdirQueryError),
+    /// A tag's flag change was refused (SEARCH §10) before anything was
+    /// read or staged.
+    #[cfg(feature = "search")]
+    Tag(crate::client::search::tag::PimdirSearchTagError),
     /// The SQLite linked in lacks what the index requires (SEARCH §2):
     /// FTS5, or the version 3.43 `contentless_delete` arrived in.
     #[cfg(feature = "search")]
@@ -1168,6 +1172,8 @@ impl fmt::Display for PimdirError {
             #[cfg(feature = "search")]
             Self::Query(err) => write!(f, "Pimdir search query refused: {err}"),
             #[cfg(feature = "search")]
+            Self::Tag(err) => write!(f, "Pimdir tag refused: {err}"),
+            #[cfg(feature = "search")]
             Self::Fts5 { version } => write!(
                 f,
                 "Pimdir search needs SQLite 3.43 or later with FTS5, and SQLite {version} is linked in: build with the vendored feature"
@@ -1216,6 +1222,13 @@ impl From<serde_json::Error> for PimdirError {
 impl From<PimdirActionError> for PimdirError {
     fn from(err: PimdirActionError) -> Self {
         Self::Action(err)
+    }
+}
+
+#[cfg(feature = "search")]
+impl From<crate::client::search::tag::PimdirSearchTagError> for PimdirError {
+    fn from(err: crate::client::search::tag::PimdirSearchTagError) -> Self {
+        Self::Tag(err)
     }
 }
 

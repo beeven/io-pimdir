@@ -24,6 +24,7 @@ use crate::cli::{
     queue::{QueueCancelOutput, QueueOutput},
     search::{
         CountOutput, IndexOutput, QueryErrorOutput, SearchOutput, SearchThreadsOutput, ShowOutput,
+        TagOutput, ThreadRow,
     },
     store::StoreInfoOutput,
 };
@@ -61,6 +62,8 @@ pub fn registry() -> JsonSchemaRegistry {
     insert!("pimdir-search-threads", SearchThreadsOutput);
     insert!("pimdir-count", CountOutput);
     insert!("pimdir-show", ShowOutput);
+    insert!("pimdir-thread", ThreadRow);
+    insert!("pimdir-tag", TagOutput);
     insert!("pimdir-query-error", QueryErrorOutput);
     insert!("pimdir-error", ErrorReport);
 
