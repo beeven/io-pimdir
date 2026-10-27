@@ -21,12 +21,12 @@ use rusqlite::types::Value;
 use crate::{
     client::search::PimdirSearchSort,
     search::query::{
-        PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryError, PimdirQueryErrorCode,
-        PimdirQueryId, PimdirQueryKind, PimdirQueryPredicate, PimdirQueryTerm, PimdirQueryText,
+        PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryDateUnit, PimdirQueryId,
+        PimdirQueryKind, PimdirQueryPredicate, PimdirQueryTerm, PimdirQueryText,
         PimdirQueryTextField,
     },
     sql::{self, search},
-    summary::file,
+    summary::{file, time},
 };
 
 /// The items each `linked:` term names, as `(kind, link id)` pairs per
@@ -51,12 +51,14 @@ pub(crate) struct Compiled {
     /// The items each `linked:` term names, as `(kind, link id)` pairs
     /// (STORAGE §14.2), resolved against the store by the caller.
     ends: Ends,
+    /// The instant relative dates resolve against, Unix seconds.
+    now: i64,
 }
 
 impl Compiled {
     /// Compiles a query, `ends` holding the items each `linked:` term
-    /// names, refusing a term this implementation does not answer yet.
-    pub(crate) fn new(query: &PimdirQuery, ends: Ends) -> Result<Self, PimdirQueryError> {
+    /// names, its relative dates resolved against `now` (Unix seconds).
+    pub(crate) fn new(query: &PimdirQuery, ends: Ends, now: i64) -> Self {
         let undated: Vec<&str> = query
             .terms()
             .into_iter()
@@ -73,9 +75,10 @@ impl Compiled {
             params: Vec::new(),
             words: Vec::new(),
             ends,
+            now,
         };
-        compiled.condition = compiled.node(query, false, &undated)?;
-        Ok(compiled)
+        compiled.condition = compiled.node(query, false, &undated);
+        compiled
     }
 
     /// The hits in `sort` order (SEARCH §8.2), `limit` of them after
@@ -178,12 +181,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
     }
 
     /// Compiles one node to a condition over `live`.
-    fn node(
-        &mut self,
-        node: &PimdirQuery,
-        negated: bool,
-        undated: &[&str],
-    ) -> Result<String, PimdirQueryError> {
+    fn node(&mut self, node: &PimdirQuery, negated: bool, undated: &[&str]) -> String {
         match node {
             PimdirQuery::And(operands) | PimdirQuery::Or(operands) => {
                 let operator = match node {
@@ -192,33 +190,19 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 };
                 let mut conditions = Vec::new();
                 for operand in operands {
-                    conditions.push(self.node(operand, negated, undated)?);
+                    conditions.push(self.node(operand, negated, undated));
                 }
-                Ok(format!("({})", conditions.join(operator)))
+                format!("({})", conditions.join(operator))
             }
             PimdirQuery::Not(operand) => {
-                Ok(format!("(NOT {})", self.node(operand, !negated, undated)?))
+                format!("(NOT {})", self.node(operand, !negated, undated))
             }
             PimdirQuery::Term(term) => self.term(term, negated, undated),
         }
     }
 
     /// Compiles one term to a condition over `live`.
-    fn term(
-        &mut self,
-        term: &PimdirQueryTerm,
-        negated: bool,
-        undated: &[&str],
-    ) -> Result<String, PimdirQueryError> {
-        let unsupported = |what: &str| {
-            PimdirQueryError::new(
-                PimdirQueryErrorCode::UnsupportedField,
-                format!("{what} is not supported by this implementation yet"),
-                term.start,
-                term.end,
-                &[],
-            )
-        };
+    fn term(&mut self, term: &PimdirQueryTerm, negated: bool, undated: &[&str]) -> String {
         let live = "FROM store.items i JOIN store.collections c ON c.id = i.collection \
                     WHERE i.deleted = 0 AND i.retained_at IS NULL";
 
@@ -231,7 +215,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                     PimdirQueryTextField::Attachment => (Some("attachment"), false),
                     PimdirQueryTextField::Place => (Some("place"), false),
                 };
-                return Ok(self.text(column, summary, text, negated));
+                return self.text(column, summary, text, negated);
             }
             PimdirQueryPredicate::Address { role, text } if text.text.contains('@') => {
                 let address = text.text.to_lowercase();
@@ -249,10 +233,21 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             }
             PimdirQueryPredicate::Address { role, text } => {
                 let column = role.map(|role| role.as_str()).unwrap_or("people");
-                return Ok(self.text(Some(column), true, text, negated));
+                return self.text(Some(column), true, text, negated);
             }
             PimdirQueryPredicate::Person(text) => self.person(text),
-            PimdirQueryPredicate::Thread(_) => return Err(unsupported("thread:")),
+            PimdirQueryPredicate::Thread(id) => {
+                // NOTE: the thread any message of it names, so a thread
+                // id still reaches its members after a join renamed it,
+                // the old id being one of theirs (SEARCH §9).
+                let thread = self.embed(search::THREAD_OF, vec![(":link_id", id.clone().into())]);
+                format!(
+                    "SELECT p.collection, p.seq FROM message m \
+                     JOIN placement p ON p.link_id = m.link_id \
+                     JOIN store.collections c ON c.id = p.collection \
+                     WHERE c.kind = 'message/rfc822' AND m.thread = ({thread})"
+                )
+            }
             PimdirQueryPredicate::Linked { role, id } => {
                 let ends = self
                     .ends
@@ -307,7 +302,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 }
             },
             PimdirQueryPredicate::Account(account) => {
-                return Ok(format!("(akey = {})", self.bind(account.clone().into())));
+                return format!("(akey = {})", self.bind(account.clone().into()));
             }
             PimdirQueryPredicate::Collection(collection) => {
                 let collection = self.bind(collection.clone().into());
@@ -317,15 +312,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 )
             }
             PimdirQueryPredicate::Date(range) => {
-                if range
-                    .start
-                    .iter()
-                    .chain(&range.end)
-                    .any(|d| d.is_relative())
-                {
-                    return Err(unsupported("A relative date"));
-                }
-                let (since, until) = bounds(range);
+                let (since, until) = bounds(range, self.now);
                 // NOTE: an open side is the earliest or the latest instant an
                 // RFC 3339 string can spell.
                 let occurring = self.embed(
@@ -363,7 +350,7 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 )
             }
             PimdirQueryPredicate::Id(PimdirQueryId::Seq(seq)) => {
-                return Ok(format!("(seq = {})", self.bind((*seq).into())));
+                return format!("(seq = {})", self.bind((*seq).into()));
             }
             PimdirQueryPredicate::Id(PimdirQueryId::Link(link)) => {
                 let link = self.bind(link.clone().into());
@@ -371,10 +358,10 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             }
         };
 
-        Ok(format!(
+        format!(
             "((akey, seq) IN (SELECT ifnull(c.account, ''), x.seq FROM ({placements}) x \
              JOIN store.collections c ON c.id = x.collection))"
-        ))
+        )
     }
 
     /// The placements of `person:` (SEARCH §8): the contacts whose title
@@ -471,6 +458,13 @@ const TITLES: &str = "FROM store.items i JOIN store.collections c ON c.id = i.co
    LEFT JOIN store.journal_summary js ON js.collection = i.collection AND js.link_id = i.link_id
    LEFT JOIN store.file_summary fs ON fs.collection = i.collection AND fs.link_id = i.link_id";
 
+/// Seconds in a day.
+const DAY: i64 = 86_400;
+
+/// The first instant of year 0, the earliest an RFC 3339 instant spells:
+/// `0000-01-01T00:00:00Z`.
+const YEAR_ZERO: i64 = -62_167_219_200;
+
 /// The collection media type of a kind.
 pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
     match kind {
@@ -483,22 +477,74 @@ pub(crate) fn media_type(kind: PimdirQueryKind) -> &'static str {
     }
 }
 
-/// The instants an absolute range spans, `[since, until)`, RFC 3339 at
-/// midnight UTC, either side `None` open.
-pub(crate) fn bounds(range: &PimdirQueryDateRange) -> (Option<String>, Option<String>) {
-    let instant = |day: String| format!("{day}T00:00:00Z");
-    (
-        range
-            .start
-            .as_ref()
-            .and_then(PimdirQueryDate::first_day)
-            .map(instant),
-        range
-            .end
-            .as_ref()
-            .and_then(PimdirQueryDate::day_after)
-            .map(instant),
-    )
+/// The instants a range spans (SEARCH §8.1), `[since, until)` as RFC 3339
+/// in UTC, either side `None` open: from the start of its first point's
+/// span to the end of its last's, a calendar point spanning its day,
+/// month or year in UTC, `today` and `yesterday` theirs around `now`
+/// (Unix seconds), and a relative amount the instant that long before
+/// `now`, its span alone running from that instant to `now`.
+///
+/// A single point is parsed as a range from it to itself, so `2w..2w`
+/// reads as `2w` alone.
+pub(crate) fn bounds(range: &PimdirQueryDateRange, now: i64) -> (Option<String>, Option<String>) {
+    let single = range.start.is_some() && range.start == range.end;
+    let since = range.start.as_ref().map(|point| span(point, now).0);
+    let until = range.end.as_ref().map(|point| match point {
+        PimdirQueryDate::Relative { .. } if single => now,
+        point => span(point, now).1,
+    });
+    (since.map(time::rfc3339), until.map(time::rfc3339))
+}
+
+/// The span of one date point, `[start, end)` in Unix seconds, a
+/// relative amount spanning its instant alone; nothing before the first
+/// instant of year 0, so an amount reaching past it is no wider.
+fn span(point: &PimdirQueryDate, now: i64) -> (i64, i64) {
+    let day = |year: u16, month: u8, day: u8| {
+        time::days_from_civil(i32::from(year), u32::from(month), u32::from(day)) * DAY
+    };
+    let midnight = now.div_euclid(DAY) * DAY;
+
+    match *point {
+        PimdirQueryDate::Year(year) => (day(year, 1, 1), day(year + 1, 1, 1)),
+        PimdirQueryDate::Month { year, month } => {
+            let next = match month {
+                12 => day(year + 1, 1, 1),
+                month => day(year, month + 1, 1),
+            };
+            (day(year, month, 1), next)
+        }
+        PimdirQueryDate::Day {
+            year,
+            month,
+            day: date,
+        } => {
+            let start = day(year, month, date);
+            (start, start + DAY)
+        }
+        PimdirQueryDate::Today => (midnight, midnight + DAY),
+        PimdirQueryDate::Yesterday => (midnight - DAY, midnight),
+        PimdirQueryDate::Relative { amount, unit } => {
+            let amount = i64::from(amount);
+            let instant = match unit {
+                PimdirQueryDateUnit::Day => now - amount * DAY,
+                PimdirQueryDateUnit::Week => now - amount * 7 * DAY,
+                PimdirQueryDateUnit::Year => {
+                    let (year, month, date) = time::civil_from_days(now.div_euclid(DAY));
+                    let year = i64::from(year) - amount;
+                    match i32::try_from(year) {
+                        Ok(year) if year >= 0 => {
+                            let date = date.min(time::days_in_month(year, month));
+                            time::days_from_civil(year, month, date) * DAY + now.rem_euclid(DAY)
+                        }
+                        _ => YEAR_ZERO,
+                    }
+                }
+            };
+            let instant = instant.max(YEAR_ZERO);
+            (instant, instant)
+        }
+    }
 }
 
 /// The FTS5 expression of a text term: the text as one escaped string, so
@@ -537,4 +583,53 @@ fn replace_param(text: &str, name: &str, position: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        client::search::compile::*,
+        search::query::{PimdirQueryPredicate, PimdirQueryTerm},
+        summary::time,
+    };
+
+    fn bounds_of(value: &str, now: i64) -> (Option<String>, Option<String>) {
+        match PimdirQuery::parse(&format!("date:{value}")).unwrap() {
+            PimdirQuery::Term(PimdirQueryTerm {
+                predicate: PimdirQueryPredicate::Date(range),
+                ..
+            }) => bounds(&range, now),
+            _ => panic!("a date term"),
+        }
+    }
+
+    #[test]
+    fn relative_dates_resolve_against_now() {
+        let now = time::unix(2028, 2, 29, 15, 30, 0);
+        let span = |since: &str, until: &str| (Some(since.into()), Some(until.into()));
+
+        assert_eq!(
+            bounds_of("1y", now),
+            span("2027-02-28T15:30:00Z", "2028-02-29T15:30:00Z"),
+            "a calendar year back from 29 February lands on the 28th"
+        );
+        assert_eq!(
+            bounds_of("3d..1d", now),
+            span("2028-02-26T15:30:00Z", "2028-02-28T15:30:00Z"),
+            "a relative side is its instant, not a span to now"
+        );
+        assert_eq!(
+            bounds_of("yesterday..today", now),
+            span("2028-02-28T00:00:00Z", "2028-03-01T00:00:00Z")
+        );
+        assert_eq!(
+            bounds_of("..2w", now),
+            (None, Some("2028-02-15T15:30:00Z".into()))
+        );
+        assert_eq!(
+            bounds_of("99999y", now).0.as_deref(),
+            Some("0000-01-01T00:00:00Z"),
+            "nothing before year 0"
+        );
+    }
 }

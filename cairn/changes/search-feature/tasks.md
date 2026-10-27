@@ -27,8 +27,8 @@ Deferred to the 2027 NLnet plan, Task 2 "pimdir Notmuch"; the plan is pimdir cai
 
 ## M3, threads and dates
 
-- [ ] `message` and `thread` tables, `thread:`, threaded listing
-- [ ] Relative dates (`today`, `2w`, ranges)
+- [x] `message` and `thread` tables, `thread:`, threaded listing (`PimdirIndex::threads`, `search --threads`, `pimdir-search-threads`); an index built before threads rebuilt through this crate's `index_build`
+- [x] Relative dates (`today`, `2w`, ranges) against `PimdirSearchClock`; `unsupported-field` removed, every field answered
 
 ## M4, this crate's part
 
@@ -43,6 +43,6 @@ Deferred to the 2027 NLnet plan, Task 2 "pimdir Notmuch"; the plan is pimdir cai
 
 ## Conformance and landing
 
-- [x] tests/search.rs over vectors/search (M1 and M2 cases; M3 cases in an explicit skip list)
+- [x] tests/search.rs over vectors/search (every case, none skipped)
 - [x] Spec: a search capability file (cairn/spec/search.md); cli.md modified
 - [ ] Fold, log, CHANGELOG (M1 logged 2026-10-27-search-index-m1; again at each milestone)

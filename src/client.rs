@@ -1052,8 +1052,8 @@ pub enum PimdirError {
         /// The sources declaring it.
         candidates: Vec<String>,
     },
-    /// A search query was refused: unparseable, or naming what this
-    /// implementation does not answer yet (SEARCH §8).
+    /// A search query was refused (SEARCH §8.4), for a caller parsing
+    /// with `?`.
     #[cfg(feature = "search")]
     Query(crate::search::query::PimdirQueryError),
     /// The SQLite linked in lacks what the index requires (SEARCH §2):

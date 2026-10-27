@@ -18,12 +18,10 @@ use std::{
 use anyhow::Result;
 use clap::{Args, ValueEnum};
 use io_pimdir::{
-    client::{
-        PimdirError,
-        search::{
-            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchHit, PimdirSearchMatched,
-            PimdirSearchOptions, PimdirSearchPlacement, PimdirSearchSort,
-        },
+    client::search::{
+        PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchHit,
+        PimdirSearchMatched, PimdirSearchOptions, PimdirSearchPlacement, PimdirSearchSort,
+        PimdirSearchThread,
     },
     placement::PimdirLevel,
     search::{
@@ -98,6 +96,15 @@ pub struct SearchCommand {
     #[arg(long, value_name = "COUNT", default_value_t = 0)]
     pub offset: usize,
 
+    /// Collapse the hits to their mail threads.
+    ///
+    /// Prints one entry per thread in each account, with its id (which
+    /// `thread:` takes), how many messages it holds there, its first and
+    /// last date and its hits; an item other than mail stands alone.
+    /// `--limit` and `--offset` then count threads.
+    #[arg(long)]
+    pub threads: bool,
+
     #[command(flatten)]
     pub refresh: RefreshFlags,
 }
@@ -112,12 +119,21 @@ impl SearchCommand {
             sort: self.sort.into(),
             limit,
             offset: self.offset,
+            clock: PimdirSearchClock::default(),
         };
 
-        let answer = match index.search(&query, &options) {
-            Err(PimdirError::Query(err)) => return refuse(printer, &self.query, err),
-            answer => answer.map_err(report)?,
-        };
+        if self.threads {
+            let answer = index.threads(&query, &options).map_err(report)?;
+
+            return printer.out(SearchThreadsOutput {
+                query: self.query,
+                next_offset: answer.more.then_some(self.offset + answer.threads.len()),
+                threads: answer.threads.iter().map(ThreadRow::from).collect(),
+                coverage: CoverageRow::from(&answer.coverage),
+            });
+        }
+
+        let answer = index.search(&query, &options).map_err(report)?;
 
         printer.out(SearchOutput {
             query: self.query,
@@ -148,10 +164,9 @@ impl CountCommand {
         let query = parse(printer, &self.query)?;
         let index = self.refresh.index(store)?;
 
-        let answer = match index.count(&query) {
-            Err(PimdirError::Query(err)) => return refuse(printer, &self.query, err),
-            answer => answer.map_err(report)?,
-        };
+        let answer = index
+            .count(&query, &PimdirSearchClock::default())
+            .map_err(report)?;
 
         printer.out(CountOutput {
             query: self.query,
@@ -400,6 +415,87 @@ impl fmt::Display for SearchOutput {
             writeln!(f, "More hits follow: pass --offset {offset}")?;
         }
         write!(f, "{}", self.coverage)
+    }
+}
+
+/// The `search --threads` output: one page of threads and what their hits
+/// could not see.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchThreadsOutput {
+    /// The query as given.
+    pub query: String,
+    /// The threads, in the order of their first hit.
+    pub threads: Vec<ThreadRow>,
+    /// The `--offset` of the next page, `null` on the last.
+    pub next_offset: Option<usize>,
+    /// What the answer could not see.
+    pub coverage: CoverageRow,
+}
+
+impl fmt::Display for SearchThreadsOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.threads.is_empty() {
+            writeln!(f, "No hit")?;
+        }
+        for thread in &self.threads {
+            let account = thread
+                .account
+                .as_deref()
+                .map(|account| format!(" in account {account}"))
+                .unwrap_or_default();
+            match &thread.thread {
+                Some(id) => writeln!(
+                    f,
+                    "Thread {id}{account}: {} message(s), {} to {}",
+                    thread.count,
+                    or_dash(thread.first.as_deref()),
+                    or_dash(thread.last.as_deref())
+                )?,
+                None => writeln!(f, "No thread{account}")?,
+            }
+            for hit in &thread.hits {
+                writeln!(f, " - {} [{}] {}", hit.seq, hit.kind, hit.title)?;
+            }
+        }
+        if let Some(offset) = self.next_offset {
+            writeln!(f, "More threads follow: pass --offset {offset}")?;
+        }
+        write!(f, "{}", self.coverage)
+    }
+}
+
+/// The hits of one thread in one account, or a hit no thread holds.
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRow {
+    /// The account, `null` in a store of one account.
+    pub account: Option<String>,
+    /// The thread id, which `thread:` takes; `null` for an item other
+    /// than mail, which no thread holds.
+    pub thread: Option<String>,
+    /// The thread's live messages in the account, hit or not; 1 outside
+    /// a thread.
+    pub count: u64,
+    /// The earliest date among them, `null` without one or outside a
+    /// thread.
+    pub first: Option<String>,
+    /// The latest.
+    pub last: Option<String>,
+    /// Its hits, in the order asked.
+    pub hits: Vec<HitRow>,
+}
+
+impl From<&PimdirSearchThread> for ThreadRow {
+    fn from(thread: &PimdirSearchThread) -> Self {
+        Self {
+            account: thread.account.clone(),
+            thread: thread.thread.clone(),
+            count: thread.count,
+            first: thread.first.clone(),
+            last: thread.last.clone(),
+            hits: thread.hits.iter().map(HitRow::from).collect(),
+        }
     }
 }
 
@@ -673,8 +769,7 @@ pub struct QueryErrorOutput {
     pub query: String,
     /// `empty-query`, `unknown-field`, `invalid-value`, `invalid-date`,
     /// `unterminated-phrase`, `unbalanced-parenthesis`,
-    /// `dangling-operator`, `invalid-wildcard`, or this implementation's
-    /// own `unsupported-field` for a field it does not answer yet.
+    /// `dangling-operator` or `invalid-wildcard`.
     pub code: String,
     /// The fault, as a sentence.
     pub message: String,

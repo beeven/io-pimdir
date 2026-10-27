@@ -360,23 +360,36 @@ pub enum PimdirQueryDate {
         /// The day, 1 to the month's last.
         day: u8,
     },
-    /// `today` or `yesterday`, resolved against the query's now.
-    Keyword(String),
-    /// An amount back from now: `3d`, `2w`, `1y`.
+    /// `today`: the calendar day holding the query's now.
+    Today,
+    /// `yesterday`: the calendar day before it.
+    Yesterday,
+    /// An amount back from now, `3d`, `2w`, `1y`: the instant that long
+    /// before the query's now.
     Relative {
         /// The amount.
         amount: u32,
-        /// The unit: `d` (days), `w` (weeks of seven days) or `y`
-        /// (calendar years).
-        unit: char,
+        /// The unit.
+        unit: PimdirQueryDateUnit,
     },
+}
+
+/// The unit of a relative date (SEARCH §8.1).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PimdirQueryDateUnit {
+    /// `d`: days.
+    Day,
+    /// `w`: weeks of seven days.
+    Week,
+    /// `y`: calendar years, a 29 February landing on the 28th.
+    Year,
 }
 
 impl PimdirQueryDate {
     /// Whether the point resolves against a now (keywords and relative
     /// amounts), rather than standing on its own.
     pub fn is_relative(&self) -> bool {
-        matches!(self, Self::Keyword(_) | Self::Relative { .. })
+        matches!(self, Self::Today | Self::Yesterday | Self::Relative { .. })
     }
 
     /// The first day of an absolute point's span, `YYYY-MM-DD`.
@@ -456,9 +469,7 @@ impl PimdirQueryError {
         expected: &[&str],
     ) -> Self {
         let fields = match code {
-            PimdirQueryErrorCode::UnknownField | PimdirQueryErrorCode::UnsupportedField => {
-                FIELDS.iter().map(ToString::to_string).collect()
-            }
+            PimdirQueryErrorCode::UnknownField => FIELDS.iter().map(ToString::to_string).collect(),
             _ => Vec::new(),
         };
 
@@ -508,10 +519,6 @@ pub enum PimdirQueryErrorCode {
     DanglingOperator,
     /// A `*` other than a trailing prefix wildcard: `invalid-wildcard`.
     InvalidWildcard,
-    /// A field or a value form SEARCH.md defines and this implementation
-    /// does not answer yet: `unsupported-field`. Not a SEARCH.md code:
-    /// this crate's own, answered by the compiler, never by the parser.
-    UnsupportedField,
 }
 
 impl PimdirQueryErrorCode {
@@ -526,7 +533,6 @@ impl PimdirQueryErrorCode {
             Self::UnbalancedParenthesis => "unbalanced-parenthesis",
             Self::DanglingOperator => "dangling-operator",
             Self::InvalidWildcard => "invalid-wildcard",
-            Self::UnsupportedField => "unsupported-field",
         }
     }
 }
@@ -1059,16 +1065,20 @@ fn stamp_range(value: &str) -> Option<(Option<i64>, Option<i64>)> {
 
 /// Reads a `point`: a year, a month, a day, a keyword or an amount.
 fn date(value: &str) -> Option<PimdirQueryDate> {
-    if matches!(value, "today" | "yesterday") {
-        return Some(PimdirQueryDate::Keyword(value.into()));
+    match value {
+        "today" => return Some(PimdirQueryDate::Today),
+        "yesterday" => return Some(PimdirQueryDate::Yesterday),
+        _ => (),
     }
 
     let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
-    if let Some(unit) = value
-        .chars()
-        .last()
-        .filter(|c| matches!(c, 'd' | 'w' | 'y'))
-    {
+    let unit = match value.bytes().last() {
+        Some(b'd') => Some(PimdirQueryDateUnit::Day),
+        Some(b'w') => Some(PimdirQueryDateUnit::Week),
+        Some(b'y') => Some(PimdirQueryDateUnit::Year),
+        _ => None,
+    };
+    if let Some(unit) = unit {
         let amount = &value[..value.len() - 1];
         if digits(amount) {
             return Some(PimdirQueryDate::Relative {

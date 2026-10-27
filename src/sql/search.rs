@@ -15,6 +15,30 @@ include!(concat!(env!("OUT_DIR"), "/search.rs"));
 /// `index_meta.tokenizer`: an index recording another is rebuilt.
 pub const TOKENIZER: &str = "unicode61 remove_diacritics 2";
 
+/// What this crate's index holds beyond the schema, recorded in its own
+/// `index_build` table: an index built under another, or before the
+/// table existed, is rebuilt like one at another schema version. 1 holds
+/// threads (SEARCH §9); an index without the table predates them.
+pub const BUILD: i64 = 1;
+
+/// The `index_build` table, this crate's own and outside SEARCH.md's
+/// schema, so its statements are not in [`OWN`]: they would not prepare
+/// on the canonical one.
+pub const BUILD_SCHEMA: &str = r#"CREATE TABLE index_build (
+    id    INTEGER PRIMARY KEY CHECK (id = 1),
+    build INTEGER NOT NULL
+) STRICT;"#;
+
+/// Records the build an index was made under.
+pub const SET_BUILD: &str = r#"INSERT INTO index_build(id, build) VALUES(1, :build);"#;
+
+/// Whether an index has the `index_build` table: one predating it has
+/// none.
+pub const HAS_BUILD: &str = r#"SELECT EXISTS (SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'index_build');"#;
+
+/// The build an index was made under; fails without `index_build`.
+pub const LOAD_BUILD: &str = r#"SELECT build FROM index_build WHERE id = 1;"#;
+
 /// Whether a collection was stamped above the cursor: a rename leaves the
 /// old id's placements to the key reconciliation (SEARCH §4).
 pub const COLLECTIONS_MOVED: &str =
@@ -76,6 +100,68 @@ WHERE (:seq IS NULL OR i.seq = :seq) AND (:link_id IS NULL OR i.link_id = :link_
 pub const PLACEMENT_HASH: &str =
     r#"SELECT hash FROM placement WHERE collection = :collection AND seq = :seq;"#;
 
+/// The link id the index holds for one placement: the message a dropped
+/// or rekeyed placement leaves to be rethreaded (SEARCH §9).
+pub const PLACEMENT_LINK_ID: &str =
+    r#"SELECT link_id FROM placement WHERE collection = :collection AND seq = :seq;"#;
+
+/// The mail placements the index holds for one message id, `count` zero
+/// for a message no placement holds: how many, the lowest sort key, the
+/// lowest and highest one naming a date (SEARCH §9).
+pub const MESSAGE_PRESENCE: &str = r#"SELECT count(*), min(i.sort_key), min(nullif(i.sort_key, '')), max(nullif(i.sort_key, ''))
+FROM placement p
+JOIN store.collections c ON c.id = p.collection
+JOIN store.items i ON i.collection = p.collection AND i.seq = p.seq
+WHERE p.link_id = :link_id AND c.kind = 'message/rfc822';"#;
+
+/// A body the index holds for one message id, the source of its
+/// `In-Reply-To` and `References` (SEARCH §9).
+pub const MESSAGE_HASH: &str = r#"SELECT p.hash FROM placement p
+JOIN store.collections c ON c.id = p.collection
+WHERE p.link_id = :link_id AND c.kind = 'message/rfc822' AND p.hash IS NOT NULL
+ORDER BY p.collection, p.seq LIMIT 1;"#;
+
+/// The `in_reply_to` of a message id's summary, the parent of a message
+/// the index holds no body of (SEARCH §9).
+pub const MESSAGE_IN_REPLY_TO: &str = r#"SELECT m.in_reply_to FROM placement p
+JOIN store.mail_summary m ON m.collection = p.collection AND m.link_id = p.link_id
+WHERE p.link_id = :link_id
+ORDER BY p.collection, p.seq LIMIT 1;"#;
+
+/// One message row: its thread and its parent.
+pub const LOAD_MESSAGE: &str = r#"SELECT thread, parent FROM message WHERE link_id = :link_id;"#;
+
+/// The messages naming one as their parent.
+pub const MESSAGE_CHILDREN: &str = r#"SELECT link_id FROM message WHERE parent = :link_id;"#;
+
+/// Drops one message row: a message no placement holds and none names.
+pub const DELETE_MESSAGE: &str = r#"DELETE FROM message WHERE link_id = :link_id;"#;
+
+/// Drops a thread row no message points to any more, after a join or a
+/// split repointed its members (SEARCH §9); a row still pointed to stays.
+pub const DELETE_THREAD_UNUSED: &str = r#"DELETE FROM thread
+WHERE id = :id AND NOT EXISTS (SELECT 1 FROM message WHERE thread = :id);"#;
+
+/// The thread of one hit, `(account, seq)`, through any of its live mail
+/// placements (SEARCH §9).
+pub const HIT_THREAD: &str = r#"SELECT m.thread FROM store.items i
+JOIN store.collections c ON c.id = i.collection
+JOIN message m ON m.link_id = i.link_id
+WHERE i.seq = :seq AND c.account IS :account AND c.kind = 'message/rfc822'
+  AND i.deleted = 0 AND i.retained_at IS NULL
+ORDER BY i.collection LIMIT 1;"#;
+
+/// A thread as one account holds it (SEARCH §9): its live members there,
+/// as `thread_members` names them, counted by `seq`, with their lowest and
+/// highest sort key naming a date.
+pub const THREAD_SPAN: &str = r#"SELECT count(DISTINCT i.seq), min(nullif(i.sort_key, '')), max(nullif(i.sort_key, ''))
+FROM message m
+JOIN placement p ON p.link_id = m.link_id
+JOIN store.collections c ON c.id = p.collection
+JOIN store.items i ON i.collection = p.collection AND i.seq = p.seq
+WHERE m.thread = :thread AND c.account IS :account AND c.kind = 'message/rfc822'
+  AND i.deleted = 0 AND i.retained_at IS NULL;"#;
+
 /// Every statement of this crate's own, paired with its constant name.
 pub const OWN: &[(&str, &str)] = &[
     ("COLLECTIONS_MOVED", COLLECTIONS_MOVED),
@@ -84,6 +170,16 @@ pub const OWN: &[(&str, &str)] = &[
     ("LOAD_HIT_PLACEMENTS", LOAD_HIT_PLACEMENTS),
     ("LOAD_ENDS", LOAD_ENDS),
     ("PLACEMENT_HASH", PLACEMENT_HASH),
+    ("PLACEMENT_LINK_ID", PLACEMENT_LINK_ID),
+    ("MESSAGE_PRESENCE", MESSAGE_PRESENCE),
+    ("MESSAGE_HASH", MESSAGE_HASH),
+    ("MESSAGE_IN_REPLY_TO", MESSAGE_IN_REPLY_TO),
+    ("LOAD_MESSAGE", LOAD_MESSAGE),
+    ("MESSAGE_CHILDREN", MESSAGE_CHILDREN),
+    ("DELETE_MESSAGE", DELETE_MESSAGE),
+    ("DELETE_THREAD_UNUSED", DELETE_THREAD_UNUSED),
+    ("HIT_THREAD", HIT_THREAD),
+    ("THREAD_SPAN", THREAD_SPAN),
 ];
 
 /// Every search statement, canonical then this crate's own, paired with

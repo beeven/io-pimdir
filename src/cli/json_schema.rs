@@ -4,7 +4,9 @@
 //! Schema of its `--json` output. [`JsonSchemaCommand`] writes one file
 //! per entry, so the map is the CLI's machine-readable contract: one
 //! entry per data command, none for the toolkit verbs, and `pimdir-error`
-//! for the failure object every command prints instead.
+//! for the failure object every command prints instead. A flag changing a
+//! command's output shape has its own entry, its name appended:
+//! `pimdir-search-threads` for `search --threads`.
 //!
 //! [`JsonSchemaCommand`]: pimalaya_cli::clap::commands::JsonSchemaCommand
 
@@ -20,7 +22,9 @@ use crate::cli::{
     gc::GcOutput,
     item::{ItemExportOutput, ItemPurgeOutput, ItemRestoreOutput, ItemShowOutput, ItemsOutput},
     queue::{QueueCancelOutput, QueueOutput},
-    search::{CountOutput, IndexOutput, QueryErrorOutput, SearchOutput, ShowOutput},
+    search::{
+        CountOutput, IndexOutput, QueryErrorOutput, SearchOutput, SearchThreadsOutput, ShowOutput,
+    },
     store::StoreInfoOutput,
 };
 
@@ -54,6 +58,7 @@ pub fn registry() -> JsonSchemaRegistry {
     insert!("pimdir-export", ExportOutput);
     insert!("pimdir-index", IndexOutput);
     insert!("pimdir-search", SearchOutput);
+    insert!("pimdir-search-threads", SearchThreadsOutput);
     insert!("pimdir-count", CountOutput);
     insert!("pimdir-show", ShowOutput);
     insert!("pimdir-query-error", QueryErrorOutput);

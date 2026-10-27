@@ -3,9 +3,8 @@
 //! owner, indexed, and asked every case of vectors/search/queries.json;
 //! the chunk boundaries of vectors/search/chunks.json.
 //!
-//! A case needing what this implementation does not answer yet is in
-//! [`SKIPPED`] with its reason, and one naming a field the compiler
-//! refuses must be refused as `unsupported-field`, never answered wrong.
+//! Every case is answered: none is skipped. A case stating `threads` is
+//! asked as a threaded listing (SEARCH §9).
 //!
 //! The spec is a sibling checkout, so the suite skips when it is absent.
 
@@ -18,12 +17,12 @@ use std::{
 };
 
 use io_pimdir::{
-    change::PimdirWriteOp,
+    change::{PimdirDropReason, PimdirWriteOp},
     client::{
-        PimdirError, PimdirStore,
+        PimdirStore,
         search::{
-            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchMatched, PimdirSearchOptions,
-            PimdirSearchSort,
+            PimdirIndex, PimdirIndexRefreshOptions, PimdirSearchClock, PimdirSearchMatched,
+            PimdirSearchOptions, PimdirSearchSort,
         },
     },
     collection::{PimdirCollectionId, PimdirScope},
@@ -43,15 +42,6 @@ use io_pimdir::{
     },
 };
 use serde_json::Value;
-
-/// The cases this implementation does not answer yet, by query, and why.
-/// A case whose reason names a field is also checked to be refused as
-/// `unsupported-field`.
-const SKIPPED: &[(&str, &str)] = &[
-    ("thread:multi-1@example.org", "M3: thread: (field)"),
-    ("date:2w", "M3: relative dates (field)"),
-    ("date:today..", "M3: relative dates (field)"),
-];
 
 fn spec_dir() -> Option<PathBuf> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -305,10 +295,12 @@ fn every_search_vector_answers() {
     let vectors = json(&spec.join("vectors/search/queries.json"));
 
     // NOTE: the horizon is drawn around the vectors' now (SEARCH §11).
+    let now = unix(vectors["now"].as_str().unwrap());
+    let clock = PimdirSearchClock { now: Some(now) };
     let mut index = PimdirIndex::open(dir.path()).unwrap();
     let report = index
         .refresh(&PimdirIndexRefreshOptions {
-            now: Some(unix(vectors["now"].as_str().unwrap())),
+            now: Some(now),
             ..Default::default()
         })
         .unwrap();
@@ -328,7 +320,6 @@ fn every_search_vector_answers() {
     let cases = vectors["cases"].as_array().unwrap();
     assert!(!cases.is_empty(), "the vectors carry no case");
 
-    let mut skipped = Vec::new();
     for case in cases {
         let query = case["query"].as_str().unwrap();
 
@@ -351,23 +342,6 @@ fn every_search_vector_answers() {
 
         let parsed = PimdirQuery::parse(query).unwrap_or_else(|err| panic!("{query:?}: {err}"));
 
-        if case.get("threads").is_some() {
-            skipped.push((query, "M3: threaded listing"));
-            continue;
-        }
-        if let Some((_, reason)) = SKIPPED.iter().find(|(skip, _)| *skip == query) {
-            if reason.contains("(field)") {
-                match index.search(&parsed, &PimdirSearchOptions::default()) {
-                    Err(PimdirError::Query(err)) => {
-                        assert_eq!(err.code.as_str(), "unsupported-field", "{query:?}")
-                    }
-                    other => panic!("{query:?}: refused as unsupported, got {other:?}"),
-                }
-            }
-            skipped.push((query, reason));
-            continue;
-        }
-
         let options = PimdirSearchOptions {
             sort: match case["sort"].as_str() {
                 Some("name") => PimdirSearchSort::Name,
@@ -376,7 +350,47 @@ fn every_search_vector_answers() {
             },
             limit: 100,
             offset: 0,
+            clock,
         };
+        if let Some(want) = case.get("threads") {
+            let answer = index
+                .threads(&parsed, &options)
+                .unwrap_or_else(|err| panic!("{query:?}: {err}"));
+            let got: BTreeSet<_> = answer
+                .threads
+                .iter()
+                .map(|thread| {
+                    let hits: BTreeSet<(String, i64)> = thread
+                        .hits
+                        .iter()
+                        .map(|hit| (hit.account.clone().unwrap_or_default(), hit.seq))
+                        .collect();
+                    (
+                        thread.thread.clone(),
+                        thread.count,
+                        thread.first.clone(),
+                        thread.last.clone(),
+                        hits,
+                    )
+                })
+                .collect();
+            let want: BTreeSet<_> = want
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|thread| {
+                    (
+                        thread["thread"].as_str().map(String::from),
+                        thread["count"].as_u64().unwrap(),
+                        thread["first"].as_str().map(String::from),
+                        thread["last"].as_str().map(String::from),
+                        pairs(&thread["hits"]).into_iter().collect::<BTreeSet<_>>(),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "{query:?}: threads");
+            continue;
+        }
         let answer = index
             .search(&parsed, &options)
             .unwrap_or_else(|err| panic!("{query:?}: {err}"));
@@ -397,7 +411,7 @@ fn every_search_vector_answers() {
             );
         }
 
-        let count = index.count(&parsed).unwrap();
+        let count = index.count(&parsed, &clock).unwrap();
         assert_eq!(count.count as usize, want.len(), "{query:?}: count");
 
         let expected = bodiless(&store, &parsed);
@@ -423,10 +437,6 @@ fn every_search_vector_answers() {
             case["horizon_left"].as_bool().unwrap_or(false),
             "{query:?}: horizon_left"
         );
-    }
-
-    for (query, reason) in &skipped {
-        eprintln!("skipped {query:?}: {reason}");
     }
 }
 
@@ -612,7 +622,12 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
         (0, 0),
         "nothing past the deadline"
     );
-    let stale = index.count(&PimdirQuery::parse("body").unwrap()).unwrap();
+    let stale = index
+        .count(
+            &PimdirQuery::parse("body").unwrap(),
+            &PimdirSearchClock::default(),
+        )
+        .unwrap();
     assert_eq!(stale.count, 0);
     assert_eq!(
         stale.coverage.local.unindexed, 2,
@@ -631,7 +646,10 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
     assert_eq!(hits(&index, "body").len(), 2);
     assert!(
         index
-            .count(&PimdirQuery::parse("body").unwrap())
+            .count(
+                &PimdirQuery::parse("body").unwrap(),
+                &PimdirSearchClock::default()
+            )
             .unwrap()
             .coverage
             .is_complete()
@@ -691,6 +709,20 @@ fn an_index_built_otherwise_is_rebuilt_and_a_held_lock_skips_the_refresh() {
 
     let mut index = PimdirIndex::open(dir.path()).unwrap();
     assert_eq!(index.cursor().unwrap(), 0, "rebuilt, not migrated");
+
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    drop(index);
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    conn.execute("DROP TABLE index_build", []).unwrap();
+    drop(conn);
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(
+        index.cursor().unwrap(),
+        0,
+        "an index from before threads is rebuilt"
+    );
 
     let held = fs::File::create(dir.path().join("index.lock")).unwrap();
     fs4::FileExt::try_lock(&held).unwrap();
@@ -834,4 +866,205 @@ fn every_field_alone_answers_in_every_order() {
         )
         .unwrap();
     assert_eq!(room.hits.len(), 1, "the event in Room 2");
+}
+
+/// A message dated 1 August 2026 at `hour`, `headers` before its own.
+fn mail(id: &str, hour: u32, headers: &str) -> Vec<u8> {
+    format!(
+        "Message-ID: <{id}>\r\n{headers}Subject: {id}\r\nFrom: Ann <ann@example.org>\r\n\
+         Date: Sat, 01 Aug 2026 {hour:02}:00:00 +0000\r\n\r\nText\r\n"
+    )
+    .into_bytes()
+}
+
+/// Deletes the message `id` filed by [`file_message`] in `INBOX`.
+fn delete_message(dir: &Path, id: &str) {
+    PimdirStore::open(dir)
+        .unwrap()
+        .for_source("local")
+        .write(vec![PimdirWriteOp::DropPlacement {
+            collection: PimdirCollectionId("INBOX".into()),
+            handle: PimdirHandle(id.into()),
+            reason: PimdirDropReason::Deleted,
+        }])
+        .unwrap();
+}
+
+/// Refreshes the index, then lists every message as threads: each its id,
+/// count and the link ids of its hits.
+fn threads(index: &mut PimdirIndex) -> BTreeSet<(String, u64, BTreeSet<String>)> {
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+    index
+        .threads(
+            &PimdirQuery::parse("kind:mail").unwrap(),
+            &PimdirSearchOptions::default(),
+        )
+        .unwrap()
+        .threads
+        .into_iter()
+        .map(|thread| {
+            let hits = thread
+                .hits
+                .iter()
+                .map(|hit| hit.placements[0].link_id.0.clone())
+                .collect();
+            (thread.thread.unwrap(), thread.count, hits)
+        })
+        .collect()
+}
+
+/// The `thread` and `message` rows index.db holds.
+fn thread_rows(dir: &Path) -> (i64, i64) {
+    let conn = rusqlite::Connection::open(dir.join("index.db")).unwrap();
+    let count = |table: &str| {
+        conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    (count("thread"), count("message"))
+}
+
+fn thread(id: &str, count: u64, hits: &[&str]) -> (String, u64, BTreeSet<String>) {
+    (
+        id.into(),
+        count,
+        hits.iter().map(|hit| hit.to_string()).collect(),
+    )
+}
+
+#[test]
+fn two_replies_to_a_parent_never_held_are_one_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    for (id, hour) in [("c1@x", 10), ("c2@x", 11)] {
+        let body = mail(
+            id,
+            hour,
+            "In-Reply-To: <p@x>\r\nReferences: <r@x> <p@x>\r\n",
+        );
+        file_message(dir.path(), "INBOX", body, &[]);
+    }
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("c1@x", 2, &["c1@x", "c2@x"])])
+    );
+    assert_eq!(
+        thread_rows(dir.path()),
+        (1, 3),
+        "the parent nobody holds has a row; References is read only without In-Reply-To"
+    );
+    assert_eq!(hits(&index, "thread:c2@x").len(), 2, "any member names it");
+}
+
+#[test]
+fn a_parent_arriving_later_joins_its_replies_and_names_the_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let reply = mail("c@x", 10, "References: <q@x> <p@x>\r\n");
+    file_message(dir.path(), "INBOX", reply, &[]);
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("c@x", 1, &["c@x"])])
+    );
+
+    file_message(dir.path(), "INBOX", mail("p@x", 9, ""), &[]);
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("p@x", 2, &["p@x", "c@x"])]),
+        "the last References id is the parent, the earliest member the name"
+    );
+    assert_eq!(thread_rows(dir.path()), (1, 2), "the old thread row went");
+}
+
+#[test]
+fn a_message_joining_two_threads_renames_them_and_drops_the_old_row() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(dir.path(), "INBOX", mail("x@x", 10, ""), &[]);
+    let reply = mail("y@x", 9, "In-Reply-To: <q@x>\r\n");
+    file_message(dir.path(), "INBOX", reply, &[]);
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("x@x", 1, &["x@x"]), thread("y@x", 1, &["y@x"]),])
+    );
+
+    let bridge = mail("q@x", 11, "In-Reply-To: <x@x>\r\n");
+    file_message(dir.path(), "INBOX", bridge, &[]);
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("y@x", 3, &["x@x", "y@x", "q@x"])])
+    );
+    assert_eq!(thread_rows(dir.path()), (1, 3));
+    assert_eq!(
+        hits(&index, "thread:x@x").len(),
+        3,
+        "the old id still reaches the thread"
+    );
+}
+
+#[test]
+fn a_cycle_is_broken_into_one_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = mail("a@x", 9, "In-Reply-To: <b@x>\r\n");
+    let b = mail("b@x", 10, "In-Reply-To: <a@x>\r\n");
+    let own = mail("o@x", 11, "In-Reply-To: <o@x>\r\n");
+    for body in [a, b, own] {
+        file_message(dir.path(), "INBOX", body, &[]);
+    }
+
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([
+            thread("a@x", 2, &["a@x", "b@x"]),
+            thread("o@x", 1, &["o@x"]),
+        ])
+    );
+    assert_eq!(thread_rows(dir.path()), (2, 3));
+
+    let conn = rusqlite::Connection::open(dir.path().join("index.db")).unwrap();
+    let edges: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM message WHERE parent IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(edges, 1, "one edge of the two, and no self edge, is kept");
+}
+
+#[test]
+fn a_deleted_member_leaves_its_thread_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    file_message(dir.path(), "INBOX", mail("a@x", 8, ""), &[]);
+    let b = mail("b@x", 9, "In-Reply-To: <a@x>\r\n");
+    file_message(dir.path(), "INBOX", b, &[]);
+    let c = mail("c@x", 10, "In-Reply-To: <b@x>\r\n");
+    file_message(dir.path(), "INBOX", c, &[]);
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("a@x", 3, &["a@x", "b@x", "c@x"])])
+    );
+
+    delete_message(dir.path(), "a@x");
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("b@x", 2, &["b@x", "c@x"])]),
+        "the earliest present member names it"
+    );
+    assert_eq!(thread_rows(dir.path()), (1, 3), "b still names a");
+
+    delete_message(dir.path(), "b@x");
+    assert_eq!(
+        threads(&mut index),
+        BTreeSet::from([thread("c@x", 1, &["c@x"])])
+    );
+    assert_eq!(
+        thread_rows(dir.path()),
+        (1, 2),
+        "b stays as c's parent, a goes, named by nobody"
+    );
 }

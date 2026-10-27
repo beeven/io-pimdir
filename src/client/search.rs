@@ -23,8 +23,10 @@
 mod compile;
 pub mod extract;
 mod occurrence;
+mod thread;
 
 use alloc::{
+    collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
     vec,
@@ -162,6 +164,8 @@ pub struct PimdirSearchOptions {
     pub limit: usize,
     /// The hits skipped before the first answered.
     pub offset: usize,
+    /// The instant relative dates resolve against.
+    pub clock: PimdirSearchClock,
 }
 
 impl Default for PimdirSearchOptions {
@@ -170,8 +174,57 @@ impl Default for PimdirSearchOptions {
             sort: PimdirSearchSort::Date,
             limit: 50,
             offset: 0,
+            clock: PimdirSearchClock::default(),
         }
     }
+}
+
+/// What a query's relative dates (`today`, `yesterday`, `2w`) resolve
+/// against (SEARCH §8.1). Calendar spans are read in UTC.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PimdirSearchClock {
+    /// The query's now, Unix seconds; `None` for the clock's.
+    pub now: Option<i64>,
+}
+
+impl PimdirSearchClock {
+    /// The query's now, Unix seconds.
+    pub fn now(&self) -> i64 {
+        self.now.unwrap_or_else(unix_now)
+    }
+}
+
+/// A threaded listing's answer (SEARCH §9): one page of the hits
+/// collapsed to their threads, and what it could not see.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PimdirSearchThreadsOutput {
+    /// The threads, in the order of their first hit.
+    pub threads: Vec<PimdirSearchThread>,
+    /// Whether threads follow this page.
+    pub more: bool,
+    /// What the answer could not see (SEARCH §8.2).
+    pub coverage: PimdirSearchCoverage,
+}
+
+/// The hits of one thread in one account (SEARCH §9), or a hit no thread
+/// holds (an item other than mail) alone.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirSearchThread {
+    /// The account, `None` in a single-account store.
+    pub account: Option<String>,
+    /// The thread id, as `thread:` takes it: the link id of its present
+    /// member with the lowest sort key; `None` for a hit no thread holds.
+    pub thread: Option<String>,
+    /// The thread's live messages in the account, hit or not; 1 for a hit
+    /// no thread holds.
+    pub count: u64,
+    /// The earliest sort key naming a date among them, `None` without
+    /// one or outside a thread.
+    pub first: Option<String>,
+    /// The latest.
+    pub last: Option<String>,
+    /// The thread's hits, in the order asked.
+    pub hits: Vec<PimdirSearchHit>,
 }
 
 /// A search's answer: one page of hits and what it could not see.
@@ -277,6 +330,15 @@ pub struct PimdirSearchItem {
     pub extract: PimdirExtract,
     /// The chunks of its `body` and `note` fields.
     pub chunks: Vec<PimdirChunk>,
+}
+
+/// A hit as a compiled query answers it, before it is described.
+struct Found {
+    account: Option<String>,
+    seq: i64,
+    /// What it matched: `body`, `summary`, or `None` when only
+    /// structured terms did.
+    matched: Option<String>,
 }
 
 /// One row of the change feed as `load_changed_items` answers it.
@@ -391,11 +453,7 @@ impl PimdirIndex {
                 .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(2)?, r.get(3)?)))?;
         let batch = options.batch.max(1);
         let blobs = self.reader.blobs();
-        let now = options.now.unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |since| since.as_secs() as i64)
-        });
+        let now = options.now.unwrap_or_else(unix_now);
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -424,12 +482,14 @@ impl PimdirIndex {
             let end = changed.last().map(|row| row.changed);
             trace!("folding {} feed rows", changed.len());
 
+            let mut touched = BTreeSet::new();
             for row in &changed {
-                fold(&tx, &blobs, &horizon, row, &mut report)?;
+                fold(&tx, &blobs, &horizon, row, &mut report, &mut touched)?;
             }
             report.folded += changed.len() as u64;
 
             if changed.len() == batch {
+                thread::relink(&tx, &blobs, &touched)?;
                 report.cursor = end.unwrap_or(report.cursor);
                 tx.execute(
                     search::SET_INDEX_CURSOR,
@@ -445,7 +505,7 @@ impl PimdirIndex {
                 |r| r.get(0),
             )?;
             if head.purges != purges || moved {
-                reconcile(&tx, &mut report)?;
+                reconcile(&tx, &mut report, &mut touched)?;
             }
 
             let unread = feed(
@@ -454,8 +514,9 @@ impl PimdirIndex {
                 named_params! { ":limit": batch as i64 },
             )?;
             for row in &unread {
-                fold(&tx, &blobs, &horizon, row, &mut report)?;
+                fold(&tx, &blobs, &horizon, row, &mut report, &mut touched)?;
             }
+            thread::relink(&tx, &blobs, &touched)?;
 
             report.cursor = end.unwrap_or(report.cursor).max(head.changed);
             tx.execute(
@@ -480,74 +541,108 @@ impl PimdirIndex {
         query: &PimdirQuery,
         options: &PimdirSearchOptions,
     ) -> Result<PimdirSearchOutput, PimdirError> {
-        let mut compiled = Compiled::new(query, self.ends(query)?)?;
+        let now = options.clock.now();
+        let mut compiled = Compiled::new(query, self.ends(query)?, now);
         // NOTE: one more than asked, so the page knows whether it is the
         // last without a count.
         let probe = options.limit.saturating_add(1);
-        let page = match options.sort {
-            PimdirSearchSort::Name => None,
-            _ => Some((probe, options.offset)),
-        };
-        let sql = compiled.select(options.sort, page);
-        trace!("search statement: {sql}");
-
-        let mut found = rows(
-            &self.conn,
-            &sql,
-            params_from_iter(compiled.params.iter()),
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(6)?,
-                ))
-            },
-        )
-        .map_err(unanswerable)?;
-        if options.sort == PimdirSearchSort::Name {
-            // NOTE: the title folded as STORAGE Annex A.2 folds `fn`,
-            // ties to the seq then the account, as the SQL order gave.
-            found.sort_by_cached_key(|(_, _, _, title)| title.to_lowercase().trim().to_string());
-            found = found.into_iter().skip(options.offset).take(probe).collect();
-        }
+        let mut found = self.found(&mut compiled, options.sort, Some((probe, options.offset)))?;
         let more = found.len() > options.limit;
         found.truncate(options.limit);
 
         let mut hits = Vec::new();
-        for (account, seq, matched, _) in found {
-            let (kind, title, placements) = self.placements(account.as_deref(), seq)?;
-            let snippet = self.snippet(&kind, &placements, &compiled.words)?;
-            hits.push(PimdirSearchHit {
-                account,
-                seq,
-                kind,
-                title,
-                sort_key: placements
-                    .iter()
-                    .map(|placement| placement.sort_key.clone())
-                    .max()
-                    .unwrap_or_default(),
-                placements,
-                matched: match matched.as_deref() {
-                    Some("body") => Some(PimdirSearchMatched::Body),
-                    Some("summary") => Some(PimdirSearchMatched::Summary),
-                    _ => None,
-                },
-                snippet,
-            });
+        for hit in found {
+            hits.push(self.hit(hit, &compiled.words)?);
         }
 
         Ok(PimdirSearchOutput {
             hits,
             more,
-            coverage: self.coverage(query)?,
+            coverage: self.coverage(query, now)?,
         })
     }
 
-    /// How many hits a query has, with what the count could not see.
-    pub fn count(&self, query: &PimdirQuery) -> Result<PimdirSearchCountOutput, PimdirError> {
-        let compiled = Compiled::new(query, self.ends(query)?)?;
+    /// One page of the threaded listing of a query (SEARCH §9): its hits
+    /// collapsed to their thread in their account, each thread with its
+    /// count, first and last date, the threads in the order of their
+    /// first hit and paged by `options.limit` and `options.offset`. A hit
+    /// no thread holds, an item other than mail, stands alone.
+    pub fn threads(
+        &self,
+        query: &PimdirQuery,
+        options: &PimdirSearchOptions,
+    ) -> Result<PimdirSearchThreadsOutput, PimdirError> {
+        let now = options.clock.now();
+        let mut compiled = Compiled::new(query, self.ends(query)?, now);
+        let found = self.found(&mut compiled, options.sort, None)?;
+
+        let mut groups: Vec<(Option<String>, Vec<Found>)> = Vec::new();
+        let mut known: BTreeMap<(Option<String>, String), usize> = BTreeMap::new();
+        for hit in found {
+            let thread: Option<String> = self
+                .conn
+                .query_row(
+                    search::HIT_THREAD,
+                    named_params! { ":seq": hit.seq, ":account": hit.account },
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(thread) = thread else {
+                groups.push((None, vec![hit]));
+                continue;
+            };
+            let key = (hit.account.clone(), thread.clone());
+            match known.get(&key) {
+                Some(at) => groups[*at].1.push(hit),
+                None => {
+                    known.insert(key, groups.len());
+                    groups.push((Some(thread), vec![hit]));
+                }
+            }
+        }
+        let more = groups.len() > options.offset.saturating_add(options.limit);
+
+        let mut threads = Vec::new();
+        for (thread, found) in groups.into_iter().skip(options.offset).take(options.limit) {
+            let account = found[0].account.clone();
+            let (count, first, last) = match &thread {
+                Some(thread) => self.conn.query_row(
+                    search::THREAD_SPAN,
+                    named_params! { ":thread": thread, ":account": account },
+                    |row| Ok((row.get::<_, i64>(0)? as u64, row.get(1)?, row.get(2)?)),
+                )?,
+                None => (1, None, None),
+            };
+            let mut hits = Vec::new();
+            for hit in found {
+                hits.push(self.hit(hit, &compiled.words)?);
+            }
+            threads.push(PimdirSearchThread {
+                account,
+                thread,
+                count,
+                first,
+                last,
+                hits,
+            });
+        }
+
+        Ok(PimdirSearchThreadsOutput {
+            threads,
+            more,
+            coverage: self.coverage(query, now)?,
+        })
+    }
+
+    /// How many hits a query has, with what the count could not see, its
+    /// relative dates resolved against `clock`.
+    pub fn count(
+        &self,
+        query: &PimdirQuery,
+        clock: &PimdirSearchClock,
+    ) -> Result<PimdirSearchCountOutput, PimdirError> {
+        let now = clock.now();
+        let compiled = Compiled::new(query, self.ends(query)?, now);
         let count: i64 = self
             .conn
             .query_row(
@@ -559,7 +654,7 @@ impl PimdirIndex {
 
         Ok(PimdirSearchCountOutput {
             count: count as u64,
-            coverage: self.coverage(query)?,
+            coverage: self.coverage(query, now)?,
         })
     }
 
@@ -622,6 +717,81 @@ impl PimdirIndex {
             chunks: extract.chunks(),
             extract,
         }))
+    }
+
+    /// The hits of a compiled query in `sort` order, `page` holding how
+    /// many after how many, `None` for them all.
+    fn found(
+        &self,
+        compiled: &mut Compiled,
+        sort: PimdirSearchSort,
+        page: Option<(usize, usize)>,
+    ) -> Result<Vec<Found>, PimdirError> {
+        let sql = compiled.select(sort, page.filter(|_| sort != PimdirSearchSort::Name));
+        trace!("search statement: {sql}");
+
+        let mut found = rows(
+            &self.conn,
+            &sql,
+            params_from_iter(compiled.params.iter()),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .map_err(unanswerable)?;
+        if sort == PimdirSearchSort::Name {
+            // NOTE: the title folded as STORAGE Annex A.2 folds `fn`,
+            // ties to the seq then the account, as the SQL order gave.
+            found.sort_by_cached_key(|(_, _, _, title)| title.to_lowercase().trim().to_string());
+            if let Some((limit, offset)) = page {
+                found = found.into_iter().skip(offset).take(limit).collect();
+            }
+        }
+
+        Ok(found
+            .into_iter()
+            .map(|(account, seq, matched, _)| Found {
+                account,
+                seq,
+                matched,
+            })
+            .collect())
+    }
+
+    /// One hit, `(account, seq)`, as an answer carries it: its kind, title
+    /// and placements, what it matched and a snippet naming `words`.
+    fn hit(&self, found: Found, words: &[String]) -> Result<PimdirSearchHit, PimdirError> {
+        let Found {
+            account,
+            seq,
+            matched,
+        } = found;
+        let (kind, title, placements) = self.placements(account.as_deref(), seq)?;
+        let snippet = self.snippet(&kind, &placements, words)?;
+
+        Ok(PimdirSearchHit {
+            account,
+            seq,
+            kind,
+            title,
+            sort_key: placements
+                .iter()
+                .map(|placement| placement.sort_key.clone())
+                .max()
+                .unwrap_or_default(),
+            placements,
+            matched: match matched.as_deref() {
+                Some("body") => Some(PimdirSearchMatched::Body),
+                Some("summary") => Some(PimdirSearchMatched::Summary),
+                _ => None,
+            },
+            snippet,
+        })
     }
 
     /// The items each `linked:` term of a query names, every kind each is
@@ -752,7 +922,7 @@ impl PimdirIndex {
     /// collections its top-level conjunction narrows to, over the date
     /// range it narrows to, and the live items there the index has not
     /// folded in yet.
-    fn coverage(&self, query: &PimdirQuery) -> Result<PimdirSearchCoverage, PimdirError> {
+    fn coverage(&self, query: &PimdirQuery, now: i64) -> Result<PimdirSearchCoverage, PimdirError> {
         let conjuncts = match query {
             PimdirQuery::And(operands) => operands.iter().collect(),
             query => vec![query],
@@ -776,7 +946,7 @@ impl PimdirIndex {
                     collections.retain(|c| c.kind == compile::media_type(*kind))
                 }
                 PimdirQueryPredicate::Date(range) => {
-                    let (start, end) = compile::bounds(range);
+                    let (start, end) = compile::bounds(range, now);
                     if start > since {
                         since = start;
                     }
@@ -849,7 +1019,7 @@ fn connect(dir: &Path) -> Result<Connection, PimdirError> {
 }
 
 /// Whether index.db holds this build's schema under this build's
-/// tokenizer.
+/// tokenizer, made under this crate's [`BUILD`](search::BUILD).
 fn is_current(conn: &Connection) -> Result<bool, PimdirError> {
     let version: i64 = conn.pragma_query_value(Some("main"), "user_version", |r| r.get(0))?;
     if version != search::VERSION {
@@ -859,9 +1029,20 @@ fn is_current(conn: &Connection) -> Result<bool, PimdirError> {
     let meta: Option<(i64, String)> = conn
         .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    Ok(meta.is_some_and(|(version, tokenizer)| {
+    if !meta.is_some_and(|(version, tokenizer)| {
         version == search::VERSION && tokenizer == search::TOKENIZER
-    }))
+    }) {
+        return Ok(false);
+    }
+
+    let built: bool = conn.query_row(search::HAS_BUILD, [], |r| r.get(0))?;
+    if !built {
+        return Ok(false);
+    }
+    let build: Option<i64> = conn
+        .query_row(search::LOAD_BUILD, [], |r| r.get(0))
+        .optional()?;
+    Ok(build == Some(search::BUILD))
 }
 
 /// Applies the index schema to an empty index.db, refusing a SQLite that
@@ -878,6 +1059,8 @@ fn init(conn: &mut Connection) -> Result<(), PimdirError> {
             return Err(err.into());
         }
     }
+    tx.execute_batch(search::BUILD_SCHEMA)?;
+    tx.execute(search::SET_BUILD, named_params! { ":build": search::BUILD })?;
     tx.pragma_update(Some("main"), "user_version", search::VERSION)?;
     tx.execute(
         search::INIT_INDEX_META,
@@ -900,6 +1083,13 @@ fn lock(dir: &Path) -> Result<Option<File>, PimdirError> {
         Ok(()) => Ok(Some(file)),
         Err(_) => Ok(None),
     }
+}
+
+/// The clock's now, Unix seconds.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
 }
 
 /// A path as a `file:` URI path: every byte but the unreserved ones and
@@ -940,18 +1130,21 @@ fn feed(
 
 /// Folds one feed row (SEARCH §4): a gone row loses its placement, a live
 /// one has its body indexed when new, its placement upserted, its summary
-/// text written while it has no body, and its flags replaced.
+/// text written while it has no body, and its flags replaced. A message
+/// placed, rebodied, rekeyed or dropped is added to `touched`, to be
+/// rethreaded before the batch commits (SEARCH §9).
 fn fold(
     tx: &Transaction,
     blobs: &crate::client::blobs::PimdirBlobs,
     horizon: &Horizon,
     row: &FeedRow,
     report: &mut PimdirIndexReport,
+    touched: &mut BTreeSet<String>,
 ) -> Result<(), PimdirError> {
     let key = named_params! { ":collection": row.collection, ":seq": row.seq };
 
     if row.gone {
-        remove(tx, &row.collection, row.seq, report)?;
+        remove(tx, &row.collection, row.seq, report, touched)?;
         return Ok(());
     }
 
@@ -960,13 +1153,22 @@ fn fold(
         _ => None,
     };
     let calendar = row.kind == "text/calendar";
-    let held: Option<String> = match calendar {
+    let mail = row.kind == "message/rfc822";
+    let held: Option<Option<String>> = match calendar || mail {
         true => tx
             .query_row(search::PLACEMENT_HASH, key, |r| r.get(0))
-            .optional()?
-            .flatten(),
+            .optional()?,
         false => None,
     };
+    if mail {
+        let keyed: Option<String> = tx
+            .query_row(search::PLACEMENT_LINK_ID, key, |r| r.get(0))
+            .optional()?;
+        if held.as_ref() != Some(&hash) || keyed.as_ref() != Some(&row.link_id) {
+            touched.extend(keyed);
+            touched.insert(row.link_id.clone());
+        }
+    }
 
     let id: i64 = tx.query_row(
         search::UPSERT_PLACEMENT,
@@ -998,7 +1200,7 @@ fn fold(
         )?;
     }
 
-    if calendar && held != hash {
+    if calendar && held.flatten() != hash {
         occurrence::expand(tx, blobs, &row.collection, row.seq, horizon, report)?;
     }
 
@@ -1014,19 +1216,23 @@ fn fold(
 }
 
 /// Drops a placement, its flags and occurrences by cascade and its
-/// summary text by the rowid the delete returns (SEARCH §4).
+/// summary text by the rowid the delete returns (SEARCH §4), adding the
+/// message it held to `touched`.
 fn remove(
     tx: &Transaction,
     collection: &str,
     seq: i64,
     report: &mut PimdirIndexReport,
+    touched: &mut BTreeSet<String>,
 ) -> Result<(), PimdirError> {
+    let key = named_params! { ":collection": collection, ":seq": seq };
+    let keyed: Option<String> = tx
+        .query_row(search::PLACEMENT_LINK_ID, key, |r| r.get(0))
+        .optional()?;
+    touched.extend(keyed);
+
     let id: Option<i64> = tx
-        .query_row(
-            search::DELETE_PLACEMENT,
-            named_params! { ":collection": collection, ":seq": seq },
-            |r| r.get(0),
-        )
+        .query_row(search::DELETE_PLACEMENT, key, |r| r.get(0))
         .optional()?;
     if let Some(id) = id {
         tx.execute(search::DELETE_SUMMARY_TEXT, named_params! { ":rowid": id })?;
@@ -1146,8 +1352,13 @@ fn extract(
 }
 
 /// Drops the placements and the bodies the store no longer holds (SEARCH
-/// §4): purged rows, a renamed collection's old id, collected objects.
-fn reconcile(tx: &Transaction, report: &mut PimdirIndexReport) -> Result<(), PimdirError> {
+/// §4): purged rows, a renamed collection's old id, collected objects, the
+/// messages they held added to `touched`.
+fn reconcile(
+    tx: &Transaction,
+    report: &mut PimdirIndexReport,
+    touched: &mut BTreeSet<String>,
+) -> Result<(), PimdirError> {
     debug!("reconciling search index keys");
     report.reconciled = true;
 
@@ -1155,7 +1366,7 @@ fn reconcile(tx: &Transaction, report: &mut PimdirIndexReport) -> Result<(), Pim
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
     })?;
     for (collection, seq) in gone {
-        remove(tx, &collection, seq, report)?;
+        remove(tx, &collection, seq, report, touched)?;
     }
 
     let objects = rows(tx, search::OBJECTS_GONE, [], |r| r.get::<_, String>(0))?;
