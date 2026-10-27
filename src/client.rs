@@ -1063,6 +1063,11 @@ pub enum PimdirError {
         /// The SQLite version linked in.
         version: &'static str,
     },
+    /// A query the grammar accepted could not be answered: the statement
+    /// it compiled to failed, which is this implementation's fault, not
+    /// the query's.
+    #[cfg(feature = "search")]
+    Unanswerable(rusqlite::Error),
     /// Another indexer holds index.lock (SEARCH §3) while this one has to
     /// create or rebuild the index.
     #[cfg(feature = "search")]
@@ -1166,6 +1171,11 @@ impl fmt::Display for PimdirError {
             Self::Fts5 { version } => write!(
                 f,
                 "Pimdir search needs SQLite 3.43 or later with FTS5, and SQLite {version} is linked in: build with the vendored feature"
+            ),
+            #[cfg(feature = "search")]
+            Self::Unanswerable(err) => write!(
+                f,
+                "Pimdir search could not answer an accepted query, an implementation fault: {err}"
             ),
             #[cfg(feature = "search")]
             Self::Indexing(store) => write!(

@@ -29,6 +29,10 @@ use crate::{
     summary::file,
 };
 
+/// The items each `linked:` term names, as `(kind, link id)` pairs per
+/// named id (STORAGE §14.2).
+pub(crate) type Ends = Vec<(PimdirQueryId, Vec<(String, String)>)>;
+
 /// A compiled query: its common table expressions, the condition a live
 /// hit meets, the parameters both bind, and what an answer reports
 /// beside its hits.
@@ -44,12 +48,15 @@ pub(crate) struct Compiled {
     pub(crate) params: Vec<Value>,
     /// The words a snippet looks for: the positive text terms'.
     pub(crate) words: Vec<String>,
+    /// The items each `linked:` term names, as `(kind, link id)` pairs
+    /// (STORAGE §14.2), resolved against the store by the caller.
+    ends: Ends,
 }
 
 impl Compiled {
-    /// Compiles a query, refusing a term this implementation does not
-    /// answer yet.
-    pub(crate) fn new(query: &PimdirQuery) -> Result<Self, PimdirQueryError> {
+    /// Compiles a query, `ends` holding the items each `linked:` term
+    /// names, refusing a term this implementation does not answer yet.
+    pub(crate) fn new(query: &PimdirQuery, ends: Ends) -> Result<Self, PimdirQueryError> {
         let undated: Vec<&str> = query
             .terms()
             .into_iter()
@@ -65,6 +72,7 @@ impl Compiled {
             condition: String::new(),
             params: Vec::new(),
             words: Vec::new(),
+            ends,
         };
         compiled.condition = compiled.node(query, false, &undated)?;
         Ok(compiled)
@@ -243,9 +251,29 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 let column = role.map(|role| role.as_str()).unwrap_or("people");
                 return Ok(self.text(Some(column), true, text, negated));
             }
-            PimdirQueryPredicate::Person(_) => return Err(unsupported("person:")),
+            PimdirQueryPredicate::Person(text) => self.person(text),
             PimdirQueryPredicate::Thread(_) => return Err(unsupported("thread:")),
-            PimdirQueryPredicate::Linked { .. } => return Err(unsupported("linked:")),
+            PimdirQueryPredicate::Linked { role, id } => {
+                let ends = self
+                    .ends
+                    .iter()
+                    .find(|(named, _)| named == id)
+                    .map(|(_, ends)| ends.clone())
+                    .unwrap_or_default();
+                let role = Value::from(role.as_ref().map(|role| role.as_str().to_string()));
+                let mut linked = vec!["SELECT NULL AS collection, NULL AS seq WHERE 0".to_string()];
+                for (kind, link_id) in ends {
+                    linked.push(self.embed(
+                        search::LINKED,
+                        vec![
+                            (":kind", kind.into()),
+                            (":link_id", link_id.into()),
+                            (":role", role.clone()),
+                        ],
+                    ));
+                }
+                linked.join(" UNION ")
+            }
             PimdirQueryPredicate::Flag(flag) => {
                 self.embed(search::FLAGGED, vec![(":flag", flag.clone().into())])
             }
@@ -298,14 +326,32 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                     return Err(unsupported("A relative date"));
                 }
                 let (since, until) = bounds(range);
+                // NOTE: an open side is the earliest or the latest instant an
+                // RFC 3339 string can spell.
+                let occurring = self.embed(
+                    search::OCCURRING_BETWEEN,
+                    vec![
+                        (":start", since.clone().unwrap_or_default().into()),
+                        (
+                            ":end",
+                            until
+                                .clone()
+                                .unwrap_or_else(|| "9999-12-31T23:59:59Z".into())
+                                .into(),
+                        ),
+                    ],
+                );
                 let since = self.bind(since.into());
                 let until = self.bind(until.into());
                 let undated = self.bind(serde_json::to_string(undated).unwrap_or_default().into());
                 format!(
-                    "SELECT i.collection, i.seq {live} AND ((c.kind IN ('message/rfc822', 'text/calendar') \
+                    "SELECT i.collection, i.seq {live} AND ((c.kind = 'message/rfc822' \
+                     OR (c.kind = 'text/calendar' AND i.object_hash IS NULL)) \
                      AND i.sort_key != '' AND ({since} IS NULL OR i.sort_key >= {since}) \
                      AND ({until} IS NULL OR i.sort_key < {until})) \
-                     OR c.kind IN (SELECT value FROM json_each({undated})))"
+                     UNION SELECT collection, seq FROM ({occurring}) \
+                     UNION SELECT i.collection, i.seq {live} \
+                     AND c.kind IN (SELECT value FROM json_each({undated}))"
                 )
             }
             PimdirQueryPredicate::Changed { since, until } => {
@@ -329,6 +375,42 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
             "((akey, seq) IN (SELECT ifnull(c.account, ''), x.seq FROM ({placements}) x \
              JOIN store.collections c ON c.id = x.collection))"
         ))
+    }
+
+    /// The placements of `person:` (SEARCH §8): the contacts whose title
+    /// matches, and every item naming one of their addresses in any role.
+    fn person(&mut self, text: &PimdirQueryText) -> String {
+        let at = self.ctes.len();
+        let contacts = match fts(Some("title"), text) {
+            None => "SELECT NULL, NULL WHERE 0".to_string(),
+            Some(expression) => {
+                let objects = self.embed(
+                    search::MATCH_OBJECTS,
+                    vec![(":match", expression.clone().into())],
+                );
+                let summaries =
+                    self.embed(search::MATCH_SUMMARIES, vec![(":match", expression.into())]);
+                format!(
+                    "SELECT m.collection, m.seq FROM ({objects}) m \
+                     JOIN store.collections c ON c.id = m.collection WHERE c.kind = 'text/vcard' \
+                     UNION SELECT m.collection, m.seq FROM ({summaries}) m \
+                     JOIN store.collections c ON c.id = m.collection WHERE c.kind = 'text/vcard'"
+                )
+            }
+        };
+        self.ctes.push(format!(
+            "p{at}(collection, seq) AS MATERIALIZED ({contacts})"
+        ));
+
+        format!(
+            "SELECT collection, seq FROM p{at} UNION \
+             SELECT i.collection, i.seq FROM store.item_address a \
+             JOIN store.items i ON i.collection = a.collection AND i.link_id = a.link_id \
+             WHERE i.deleted = 0 AND i.retained_at IS NULL AND a.address IN ( \
+               SELECT e.address FROM store.item_address e \
+               JOIN store.items ei ON ei.collection = e.collection AND ei.link_id = e.link_id \
+               WHERE e.role = 'email' AND (ei.collection, ei.seq) IN (SELECT collection, seq FROM p{at}))"
+        )
     }
 
     /// Compiles a text term to a `t<n>` expression of its matches over
@@ -364,8 +446,12 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                 union
             }
         };
-        self.ctes
-            .push(format!("t{at}(akey, seq, src, rank) AS ({cte})"));
+        // NOTE: materialised, so `bm25` runs in the full-text query that
+        // ranks; flattened into the statement reading `rank`, a lone
+        // `match_objects` would call it outside one, which FTS5 refuses.
+        self.ctes.push(format!(
+            "t{at}(akey, seq, src, rank) AS MATERIALIZED ({cte})"
+        ));
 
         if !negated {
             self.positive.push(at);

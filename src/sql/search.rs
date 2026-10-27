@@ -63,12 +63,27 @@ LEFT JOIN store.file_summary f ON f.collection = i.collection AND f.link_id = i.
 WHERE i.seq = :seq AND c.account IS :account AND i.deleted = 0 AND i.retained_at IS NULL
 ORDER BY i.collection;"#;
 
+/// The item an `id:` value names, every kind it is held under (SEARCH §8):
+/// by `seq` or by link id, its live placements' kinds and keys, so
+/// `linked` is asked once per pair.
+pub const LOAD_ENDS: &str = r#"SELECT DISTINCT c.kind, i.link_id FROM store.items i
+JOIN store.collections c ON c.id = i.collection
+WHERE (:seq IS NULL OR i.seq = :seq) AND (:link_id IS NULL OR i.link_id = :link_id)
+  AND i.deleted = 0 AND i.retained_at IS NULL;"#;
+
+/// The body the index holds for one placement, `NULL` while bodiless: what
+/// its occurrences are expanded from (SEARCH §7).
+pub const PLACEMENT_HASH: &str =
+    r#"SELECT hash FROM placement WHERE collection = :collection AND seq = :seq;"#;
+
 /// Every statement of this crate's own, paired with its constant name.
 pub const OWN: &[(&str, &str)] = &[
     ("COLLECTIONS_MOVED", COLLECTIONS_MOVED),
     ("LOAD_UNREAD_BODIES", LOAD_UNREAD_BODIES),
     ("COUNT_UNINDEXED", COUNT_UNINDEXED),
     ("LOAD_HIT_PLACEMENTS", LOAD_HIT_PLACEMENTS),
+    ("LOAD_ENDS", LOAD_ENDS),
+    ("PLACEMENT_HASH", PLACEMENT_HASH),
 ];
 
 /// Every search statement, canonical then this crate's own, paired with

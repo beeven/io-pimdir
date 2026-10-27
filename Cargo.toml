@@ -20,7 +20,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["client", "vendored"]
 client = ["dep:fs4", "dep:rusqlite"]
-search = ["client", "dep:mail-parser"]
+search = ["client", "dep:ical-rs", "dep:mail-parser", "dep:vcard-rs"]
 cli = ["client", "search", "dep:anyhow", "dep:clap", "dep:humantime", "dep:pimalaya-cli", "dep:schemars"]
 vendored = ["rusqlite?/bundled"]
 
@@ -48,6 +48,7 @@ blake3 = { version = "1", default-features = false }
 clap = { version = "4.4", default-features = false, features = ["derive", "std", "help", "usage", "error-context", "suggestions", "wrap_help"], optional = true }
 fs4 = { version = "1.1", default-features = false, features = ["sync"], optional = true }
 humantime = { version = "2.2", default-features = false, optional = true }
+ical-rs = { version = "0.6", default-features = false, features = ["parser", "tzdb"], optional = true }
 log = { version = "0.4", default-features = false }
 mail-parser = { version = "0.11", default-features = false, features = ["full_encoding"], optional = true }
 pimalaya-cli = { version = "0.2", default-features = false, features = ["prompt", "table", "terminal"], optional = true }
@@ -56,6 +57,8 @@ schemars = { version = "1", default-features = false, features = ["derive", "std
 serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11", default-features = false }
+vcard-rs = { version = "0.5", default-features = false, features = ["parser"], optional = true }
 
 [patch.crates-io]
+ical-rs = { git = "https://github.com/pimalaya/ical", rev = "99b92736a6a076c72936fac29c9b85a5168e4c2f" }
 pimalaya-cli = { git = "https://github.com/pimalaya/cli", rev = "55b66933950f02541892407667e5e0b254245871" }

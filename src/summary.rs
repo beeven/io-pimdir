@@ -16,7 +16,7 @@ pub mod calendar;
 pub mod contact;
 pub mod file;
 pub mod mail;
-mod time;
+pub(crate) mod time;
 
 use alloc::{format, string::String, vec::Vec};
 

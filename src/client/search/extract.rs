@@ -7,20 +7,25 @@
 //! Mail goes through mail-parser: the MIME walk, transfer encodings,
 //! charsets, RFC 2047 and RFC 2231, `text/plain` preferred within an
 //! alternative and `text/html` reduced to text, under the depth bound the
-//! summaries keep ([`MIME_DEPTH_MAX`]). Every other kind, and a placement
-//! holding no body, is read from its summary and address rows; vCard and
-//! iCalendar extraction proper is the next milestone's.
+//! summaries keep ([`MIME_DEPTH_MAX`]). A vCard goes through vcard-rs and
+//! an iCalendar resource through ical-rs. A file, a placement holding no
+//! body and a body no parser accepts are read from their summary and
+//! address rows.
 
 use alloc::{
+    borrow::Cow,
     format,
     string::{String, ToString},
+    vec,
     vec::Vec,
 };
 use core::ops::Range;
 
+use ical::{param::IcalParam, tree::cst::IcalCst, value::IcalValue};
 use mail_parser::{
     Address, Message, MessageParser, MimeHeaders, PartType, decoders::html::html_to_text,
 };
+use vcard::{tree::cst::VcardCst, value::VcardValue};
 
 use crate::{
     search::chunk,
@@ -151,9 +156,140 @@ impl PimdirExtract {
         extract
     }
 
+    /// Extracts a body of a collection kind (media type) whose content
+    /// SEARCH §6 reads: mail, a vCard or an iCalendar resource; `None` for
+    /// any other kind, a file's included, which is read from its summary.
+    pub fn body(kind: &str, body: &[u8]) -> Option<Self> {
+        match kind.split(';').next().unwrap_or_default().trim() {
+            "message/rfc822" => Some(Self::mail(body)),
+            "text/vcard" => Some(Self::contact(body)),
+            "text/calendar" => Some(Self::calendar(body)),
+            _ => None,
+        }
+    }
+
+    /// Extracts a `text/vcard` body through vcard-rs: `FN`, `N` and
+    /// `NICKNAME` as the title, every `EMAIL` and the `FN` as people (the
+    /// addresses also under `email`), `ADR` as the place, `ORG`, `TITLE`
+    /// and `ROLE` as the organisation, `NOTE` and every `TEL`, as written
+    /// and as its digits alone, as the note. One no parser accepts is
+    /// [`Unparseable`](PimdirExtractStatus::Unparseable) with every field
+    /// empty, which the caller fills from the summary.
+    pub fn contact(body: &[u8]) -> Self {
+        let Ok(cst) = VcardCst::parse(body) else {
+            return Self {
+                status: PimdirExtractStatus::Unparseable,
+                ..Default::default()
+            };
+        };
+
+        let mut extract = Self::default();
+        for prop in cst.decode().properties {
+            let name = prop.name.to_ascii_uppercase();
+            let text = vcard_text(&prop.value);
+            match name.as_str() {
+                "FN" => {
+                    push(&mut extract.title, &text);
+                    push(&mut extract.people, &text);
+                }
+                "N" | "NICKNAME" => push(&mut extract.title, &text),
+                "EMAIL" => {
+                    push(&mut extract.email, &text);
+                    push(&mut extract.people, &text);
+                }
+                "ADR" => push(&mut extract.place, &text),
+                "ORG" | "TITLE" | "ROLE" => push(&mut extract.org, &text),
+                "NOTE" => push(&mut extract.note, &text),
+                "TEL" => {
+                    let number = text.strip_prefix("tel:").unwrap_or(&text);
+                    let digits: String = number.chars().filter(char::is_ascii_digit).collect();
+                    push(&mut extract.note, number);
+                    if digits != number {
+                        push(&mut extract.note, &digits);
+                    }
+                }
+                _ => (),
+            }
+        }
+
+        extract
+    }
+
+    /// Extracts a `text/calendar` body through ical-rs, from every event,
+    /// task and journal of the resource, overrides included: `SUMMARY` as
+    /// the title, `ORGANIZER` and `ATTENDEE` with their `CN` as people and
+    /// under their roles, `DESCRIPTION` as the body, the names `ATTACH`
+    /// states as attachments, `LOCATION` as the place and `COMMENT` as the
+    /// note. One no parser accepts is
+    /// [`Unparseable`](PimdirExtractStatus::Unparseable) with every field
+    /// empty, which the caller fills from the summary.
+    pub fn calendar(body: &[u8]) -> Self {
+        let Ok(cst) = IcalCst::parse(body) else {
+            return Self {
+                status: PimdirExtractStatus::Unparseable,
+                ..Default::default()
+            };
+        };
+
+        let mut extract = Self::default();
+        let calendar = cst.decode();
+        let items = calendar.components.iter().filter(|component| {
+            matches!(
+                component.name.to_ascii_uppercase().as_str(),
+                "VEVENT" | "VTODO" | "VJOURNAL"
+            )
+        });
+        for component in items {
+            for prop in &component.props {
+                let name = prop.name.to_ascii_uppercase();
+                let text = ical_text(&prop.value);
+                match name.as_str() {
+                    "SUMMARY" => push(&mut extract.title, &text),
+                    "DESCRIPTION" => push(&mut extract.body, &text),
+                    "LOCATION" => push(&mut extract.place, &text),
+                    "COMMENT" => push(&mut extract.note, &text),
+                    "ORGANIZER" | "ATTENDEE" => {
+                        let address = text
+                            .get(..7)
+                            .filter(|scheme| scheme.eq_ignore_ascii_case("mailto:"))
+                            .map_or(text.as_str(), |_| &text[7..]);
+                        let cn = prop.params.iter().find_map(|param| match param {
+                            IcalParam::Cn(cn) => Some(cn.as_ref()),
+                            _ => None,
+                        });
+                        let text = person(cn, address);
+                        let field = match name.as_str() {
+                            "ORGANIZER" => &mut extract.organizer,
+                            _ => &mut extract.attendee,
+                        };
+                        push(field, &text);
+                        push(&mut extract.people, &text);
+                    }
+                    "ATTACH" => {
+                        for param in &prop.params {
+                            if let IcalParam::Unknown { name, values } = param
+                                && matches!(
+                                    name.to_ascii_uppercase().as_str(),
+                                    "FILENAME" | "X-FILENAME"
+                                )
+                            {
+                                for value in values {
+                                    push(&mut extract.attachment, value);
+                                }
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+            }
+        }
+
+        extract
+    }
+
     /// Extracts an item from its summary and address rows: a placement
-    /// holding no body (SEARCH §6), a file whatever it holds, and for now
-    /// a contact or a calendar item.
+    /// holding no body (SEARCH §6), a file whatever it holds, and a
+    /// contact or a calendar item no parser accepts.
     pub fn summary(
         summary: Option<&PimdirSummary>,
         addresses: &[(PimdirAddressRole, PimdirAddress)],
@@ -336,4 +472,49 @@ fn push(field: &mut String, line: &str) {
         field.push('\n');
     }
     field.push_str(line);
+}
+
+/// A vCard value as text: a text, each component of a list or a
+/// structured value on its own line, a URI as written.
+fn vcard_text(value: &VcardValue) -> String {
+    let mut text = String::new();
+    let lists: Vec<&Vec<Cow<str>>> = match value {
+        VcardValue::Text(value) => return value.0.to_string(),
+        VcardValue::Uri(value) => return value.0.to_string(),
+        VcardValue::TextList(list) => vec![&list.0],
+        VcardValue::Org(org) => vec![&org.0],
+        VcardValue::N(n) => vec![&n.prefixes, &n.given, &n.additional, &n.family, &n.suffixes],
+        VcardValue::Adr(adr) => vec![
+            &adr.po_box,
+            &adr.extended,
+            &adr.street,
+            &adr.locality,
+            &adr.region,
+            &adr.postal_code,
+            &adr.country,
+        ],
+        _ => Vec::new(),
+    };
+    for value in lists.into_iter().flatten() {
+        push(&mut text, value);
+    }
+    text
+}
+
+/// An iCalendar value as text: a text, a list's items on their own lines,
+/// an address or a URI as written.
+fn ical_text(value: &IcalValue) -> String {
+    match value {
+        IcalValue::Text(text) => text.0.to_string(),
+        IcalValue::TextList(list) => {
+            let mut text = String::new();
+            for item in &list.0 {
+                push(&mut text, item);
+            }
+            text
+        }
+        IcalValue::CalAddress(address) => address.0.to_string(),
+        IcalValue::Uri(uri) => uri.0.to_string(),
+        _ => String::new(),
+    }
 }

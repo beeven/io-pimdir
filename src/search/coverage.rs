@@ -24,6 +24,11 @@ pub struct PimdirSearchCoverage {
     pub temporal: PimdirSearchTemporal,
     /// Whether a server-side search was merged in.
     pub remote: PimdirSearchRemote,
+    /// Whether the query's date range leaves the horizon calendar
+    /// occurrences are materialised within (SEARCH §7, §8.1), with a
+    /// calendar in scope: an occurrence outside it is not seen. Always
+    /// false for the store's own reads, which read no occurrence.
+    pub horizon_left: bool,
 }
 
 impl PimdirSearchCoverage {
@@ -37,16 +42,18 @@ impl PimdirSearchCoverage {
         self.local.unindexed += other.local.unindexed;
         self.temporal.merge(&other.temporal);
         self.remote.merge(&other.remote);
+        self.horizon_left |= other.horizon_left;
     }
 
     /// Whether the answer is the whole answer: nothing bodiless or
-    /// unindexed in scope, the range wholly held, and no server-side
-    /// search left partial.
+    /// unindexed in scope, the range wholly held and inside the horizon,
+    /// and no server-side search left partial.
     pub fn is_complete(&self) -> bool {
         self.local.bodiless.values().all(|count| *count == 0)
             && self.local.unindexed == 0
             && self.temporal == PimdirSearchTemporal::Full
             && self.remote != PimdirSearchRemote::Augmented { exhaustive: false }
+            && !self.horizon_left
     }
 }
 
@@ -234,6 +241,7 @@ mod tests {
                 true,
             ),
             remote: PimdirSearchRemote::Augmented { exhaustive: true },
+            horizon_left: false,
         };
         coverage.merge(&other);
         coverage.merge(&mail);

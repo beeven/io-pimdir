@@ -26,7 +26,7 @@ use io_pimdir::{
             PimdirSearchSort,
         },
     },
-    collection::PimdirCollectionId,
+    collection::{PimdirCollectionId, PimdirScope},
     object::{PimdirHash, PimdirObject},
     placement::{
         PimdirFlags, PimdirHandle, PimdirLevel, PimdirLinkId, PimdirPlacement, PimdirSortKey,
@@ -35,6 +35,7 @@ use io_pimdir::{
     reference::{PimdirEndpoint, PimdirReferenceOrigin, PimdirReferenceRole},
     search::{
         chunk,
+        coverage::PimdirSearchTemporal,
         query::{PimdirQuery, PimdirQueryPredicate},
     },
     summary::{
@@ -47,25 +48,6 @@ use serde_json::Value;
 /// A case whose reason names a field is also checked to be refused as
 /// `unsupported-field`.
 const SKIPPED: &[(&str, &str)] = &[
-    ("date:2026-11-06", "M2: occurrences within the horizon"),
-    ("person:jane", "M2: person: (field)"),
-    (
-        "33612345678",
-        "M2: vCard extraction (TEL in the note field)",
-    ),
-    ("linked:6", "M2: linked: (field)"),
-    (
-        "linked:invitation:event-series@example.org",
-        "M2: linked: (field)",
-    ),
-    ("linked:4", "M2: linked: (field)"),
-    ("linked:sender:4", "M2: linked: (field)"),
-    ("linked:attachment:8 kind:file", "M2: linked: (field)"),
-    ("linked:10", "M2: linked: (field)"),
-    (
-        "linked:attachment:attach-1@example.org",
-        "M2: linked: (field)",
-    ),
     ("thread:multi-1@example.org", "M3: thread: (field)"),
     ("date:2w", "M3: relative dates (field)"),
     ("date:today..", "M3: relative dates (field)"),
@@ -178,6 +160,34 @@ fn build(spec: &Path, dir: &Path) {
             }
         }
         kinds.insert(id.to_string(), kind.to_string());
+        drop(owner);
+
+        // NOTE: a coverage row is what a source's rounds leave (STORAGE
+        // §10): one closed, or one still open when none ever closed.
+        for source in collection["sources"].as_array().into_iter().flatten() {
+            let scope = PimdirScope {
+                since: source["covered_since"].as_str().map(Into::into),
+                until: source["covered_until"].as_str().map(Into::into),
+            };
+            let mut ops = vec![PimdirWriteOp::OpenRound {
+                collection: PimdirCollectionId(id.into()),
+                scope: scope.clone(),
+                band: false,
+            }];
+            if !source["covered_at"].is_null() {
+                ops.push(PimdirWriteOp::CloseRound {
+                    collection: PimdirCollectionId(id.into()),
+                    coverage: scope,
+                    checkpoint: None,
+                });
+            }
+            PimdirStore::open(dir)
+                .unwrap()
+                .for_account(collection["account"].as_str().unwrap())
+                .for_source(source["source"].as_str().unwrap())
+                .write(ops)
+                .unwrap();
+        }
     }
 
     let mut store_handle = PimdirStore::open(dir).unwrap().for_source("vectors");
@@ -292,20 +302,29 @@ fn every_search_vector_answers() {
     };
     let dir = tempfile::tempdir().unwrap();
     build(&spec, dir.path());
+    let vectors = json(&spec.join("vectors/search/queries.json"));
 
+    // NOTE: the horizon is drawn around the vectors' now (SEARCH §11).
     let mut index = PimdirIndex::open(dir.path()).unwrap();
     let report = index
-        .refresh(&PimdirIndexRefreshOptions::default())
+        .refresh(&PimdirIndexRefreshOptions {
+            now: Some(unix(vectors["now"].as_str().unwrap())),
+            ..Default::default()
+        })
         .unwrap();
     assert!(report.is_current(), "one pass folds the whole feed");
-
-    let vectors = json(&spec.join("vectors/search/queries.json"));
     let coverage: BTreeMap<String, u64> = vectors["coverage"]
         .as_object()
         .unwrap()
         .iter()
         .map(|(kind, count)| (kind.clone(), count.as_u64().unwrap()))
         .collect();
+    let store = json(&spec.join("vectors/search/store.json"));
+    assert_eq!(
+        bodiless(&store, &PimdirQuery::parse("changed:0..").unwrap()),
+        coverage,
+        "the store-wide coverage the vectors state"
+    );
     let cases = vectors["cases"].as_array().unwrap();
     assert!(!cases.is_empty(), "the vectors carry no case");
 
@@ -381,40 +400,29 @@ fn every_search_vector_answers() {
         let count = index.count(&parsed).unwrap();
         assert_eq!(count.count as usize, want.len(), "{query:?}: count");
 
-        // NOTE: the vectors state the store-wide bodiless count; a query
-        // narrowed by kind sees the kinds it names alone.
-        let named: Vec<&str> = parsed
-            .terms()
-            .into_iter()
-            .filter_map(|(term, negated)| match &term.predicate {
-                PimdirQueryPredicate::Kind(kind) if !negated => Some(kind.as_str()),
-                _ => None,
-            })
-            .collect();
-        let narrowed =
-            matches!(parsed, PimdirQuery::And(_)) || matches!(parsed, PimdirQuery::Term(_));
-        let expected: BTreeMap<String, u64> = coverage
-            .iter()
-            .filter(|(kind, _)| {
-                !narrowed
-                    || named.is_empty()
-                    || named.iter().any(|name| match *name {
-                        "mail" => kind.as_str() == "message/rfc822",
-                        "file" => kind.as_str() == "application/octet-stream",
-                        _ => false,
-                    })
-            })
-            .map(|(kind, count)| (kind.clone(), *count))
-            .collect();
+        let expected = bodiless(&store, &parsed);
         assert_eq!(
             answer.coverage.local.bodiless, expected,
             "{query:?}: coverage"
         );
         assert_eq!(answer.coverage.local.unindexed, 0, "{query:?}: unindexed");
-
-        if case.get("horizon_left").is_some() {
-            skipped.push((query, "M2: horizon_left unchecked, hits checked"));
+        if let Some(temporal) = case.get("temporal") {
+            let expected = match temporal.as_str() {
+                Some("full") => PimdirSearchTemporal::Full,
+                _ => PimdirSearchTemporal::Bounded {
+                    since: temporal["since"].as_str().map(Into::into),
+                    until: temporal["until"].as_str().map(Into::into),
+                    filling: temporal["filling"].as_bool().unwrap(),
+                },
+            };
+            assert_eq!(answer.coverage.temporal, expected, "{query:?}: temporal");
         }
+
+        assert_eq!(
+            answer.coverage.horizon_left,
+            case["horizon_left"].as_bool().unwrap_or(false),
+            "{query:?}: horizon_left"
+        );
     }
 
     for (query, reason) in &skipped {
@@ -467,6 +475,21 @@ fn a_hit_says_what_it_matched_and_carries_a_snippet() {
     assert!(item.extract.attachment.contains("invoice.pdf"));
     assert_eq!(item.extract.body.trim(), "Attached.");
     assert!(index.item(Some("work"), 13).unwrap().is_none());
+
+    let card = index.item(Some("home"), 5).unwrap().unwrap().extract;
+    assert_eq!(card.title, "Doe, Jane\nJane\nDoe");
+    assert_eq!(card.org, "Example, Inc.\nResearch");
+    assert_eq!(card.email, "Jane.Doe@Example.COM");
+    assert_eq!(
+        card.note,
+        "+33 6 12 34 56 78\n33612345678\nFirst linecontinued."
+    );
+
+    let event = index.item(Some("home"), 6).unwrap().unwrap().extract;
+    assert_eq!(
+        (event.title.as_str(), event.place.as_str()),
+        ("Weekly sync", "Room 2")
+    );
 }
 
 #[test]
@@ -581,6 +604,7 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
     let past = PimdirIndexRefreshOptions {
         batch: 1,
         deadline: Some(std::time::Instant::now()),
+        now: None,
     };
     let report = index.refresh(&past).unwrap();
     assert_eq!(
@@ -599,7 +623,7 @@ fn a_refresh_follows_the_feed_within_its_deadline() {
     let report = index
         .refresh(&PimdirIndexRefreshOptions {
             batch: 1,
-            deadline: None,
+            ..Default::default()
         })
         .unwrap();
     assert!(report.is_current());
@@ -683,4 +707,131 @@ fn an_index_built_otherwise_is_rebuilt_and_a_held_lock_skips_the_refresh() {
             .is_current()
     );
     assert_eq!(hits(&index, "alpha").len(), 1);
+}
+
+/// The bodiless live items per kind a query's coverage counts, from the
+/// vector store: those no file collection holds (SEARCH §8.2), in the
+/// collections its top-level `account:`, `collection:` and `kind:` terms
+/// narrow to.
+fn bodiless(store: &Value, query: &PimdirQuery) -> BTreeMap<String, u64> {
+    let conjuncts = match query {
+        PimdirQuery::And(operands) => operands.iter().collect(),
+        query => vec![query],
+    };
+    let collections = store["collections"].as_array().unwrap();
+    let in_scope = |collection: &Value| {
+        conjuncts.iter().all(|conjunct| {
+            let PimdirQuery::Term(term) = conjunct else {
+                return true;
+            };
+            match &term.predicate {
+                PimdirQueryPredicate::Account(account) => collection["account"] == *account,
+                PimdirQueryPredicate::Collection(id) => collection["id"] == *id,
+                PimdirQueryPredicate::Kind(kind) => {
+                    let media = match kind.as_str() {
+                        "mail" => "message/rfc822",
+                        "contact" => "text/vcard",
+                        "file" => "application/octet-stream",
+                        _ => "text/calendar",
+                    };
+                    collection["kind"] == media
+                }
+                _ => true,
+            }
+        })
+    };
+
+    let mut counts = BTreeMap::new();
+    for item in store["items"].as_array().unwrap() {
+        let collection = collections
+            .iter()
+            .find(|c| c["id"] == item["collection"])
+            .unwrap();
+        let kind = collection["kind"].as_str().unwrap();
+        if item.get("fixture").is_none()
+            && kind != "application/octet-stream"
+            && in_scope(collection)
+        {
+            *counts.entry(kind.to_string()).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// An RFC 3339 instant in UTC, `YYYY-MM-DDTHH:MM:SSZ`, as Unix seconds.
+fn unix(instant: &str) -> i64 {
+    let part = |range: core::ops::Range<usize>| instant[range].parse::<i64>().unwrap();
+    let (year, month, day) = (part(0..4), part(5..7), part(8..10));
+
+    // NOTE: days from the epoch to a civil date, proleptic Gregorian.
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let of_era = year - era * 400;
+    let of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
+
+    days * 86_400 + part(11..13) * 3_600 + part(14..16) * 60 + part(17..19)
+}
+
+/// Every text field alone answers in every order: a term matching bodies
+/// alone once ranked outside its full-text query, which FTS5 refuses.
+#[test]
+fn every_field_alone_answers_in_every_order() {
+    let Some(spec) = spec_dir() else {
+        eprintln!("skipped: no pimdir spec checkout beside this one");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    build(&spec, dir.path());
+    let mut index = PimdirIndex::open(dir.path()).unwrap();
+    index
+        .refresh(&PimdirIndexRefreshOptions::default())
+        .unwrap();
+
+    let queries = [
+        "location:room",
+        "location:\"Room 2\"",
+        "attachment:invoice",
+        "mimetype:pdf",
+        "body:roadmap",
+        "body:roa*",
+        "title:sync",
+        "subject:sync",
+        "summary:sync",
+        "with:alice",
+        "from:alice",
+        "to:bob",
+        "cc:carol",
+        "bcc:bob",
+        "email:jane",
+        "organizer:alice",
+        "attendee:bob",
+        "person:jane",
+        "not body:roadmap",
+    ];
+    let sorts = [
+        PimdirSearchSort::Date,
+        PimdirSearchSort::Name,
+        PimdirSearchSort::Relevance,
+    ];
+    for query in queries {
+        let parsed = PimdirQuery::parse(query).unwrap();
+        for sort in sorts {
+            let options = PimdirSearchOptions {
+                sort,
+                ..Default::default()
+            };
+            if let Err(err) = index.search(&parsed, &options) {
+                panic!("{query:?} sorted {sort:?}: {err}");
+            }
+        }
+    }
+
+    let room = index
+        .search(
+            &PimdirQuery::parse("location:room").unwrap(),
+            &PimdirSearchOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(room.hits.len(), 1, "the event in Room 2");
 }

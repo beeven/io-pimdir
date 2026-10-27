@@ -21,9 +21,9 @@ Deferred to the 2027 NLnet plan, Task 2 "pimdir Notmuch"; the plan is pimdir cai
 
 ## M2, cross-domain
 
-- [ ] vCard and iCalendar extraction; the role fields
-- [ ] `kind:`, `with:` (answered since M1, `with:` from the summaries' address rows), `person:`, `linked:`
-- [ ] Occurrences within the horizon; the roll; the per-item bound
+- [x] vCard and iCalendar extraction (vcard-rs 0.5, ical-rs 0.6); the role fields
+- [x] `kind:`, `with:` (answered since M1, `with:` from the summaries' address rows), `person:`, `linked:`
+- [x] Occurrences within the horizon; the roll; the per-item bound; the tzdb version; `horizon_left` in coverage
 
 ## M3, threads and dates
 
@@ -43,6 +43,6 @@ Deferred to the 2027 NLnet plan, Task 2 "pimdir Notmuch"; the plan is pimdir cai
 
 ## Conformance and landing
 
-- [x] tests/search.rs over vectors/search (M1 cases; M2 and M3 cases in an explicit skip list)
+- [x] tests/search.rs over vectors/search (M1 and M2 cases; M3 cases in an explicit skip list)
 - [x] Spec: a search capability file (cairn/spec/search.md); cli.md modified
 - [ ] Fold, log, CHANGELOG (M1 logged 2026-10-27-search-index-m1; again at each milestone)

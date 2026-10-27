@@ -12,12 +12,17 @@
 //! held elsewhere is reported, never waited out. The index is derived:
 //! dropping index.db loses nothing.
 //!
+//! A refresh also keeps calendar time: every occurrence of a calendar
+//! item within the horizon around its `now`, re-expanded as the horizon
+//! rolls or the time zone database moves (SEARCH §7).
+//!
 //! A one-shot answer refreshes first within a deadline and says in its
 //! coverage what it could not fold in; a session following the feed calls
 //! [`refresh`](PimdirIndex::refresh) whenever the store moves.
 
 mod compile;
 pub mod extract;
+mod occurrence;
 
 use alloc::{
     format,
@@ -30,7 +35,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use fs4::FileExt;
@@ -46,8 +51,9 @@ use crate::{
         reader::PimdirReader,
         rows,
         search::{
-            compile::Compiled,
+            compile::{Compiled, Ends},
             extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
+            occurrence::Horizon,
         },
         write::{load_addresses, load_summaries, tables_of},
     },
@@ -56,7 +62,7 @@ use crate::{
     placement::{PimdirFlags, PimdirLevel, PimdirLinkId},
     search::{
         coverage::PimdirSearchCoverage,
-        query::{PimdirQuery, PimdirQueryKind, PimdirQueryPredicate},
+        query::{PimdirQuery, PimdirQueryId, PimdirQueryKind, PimdirQueryPredicate},
     },
     sql::search,
     summary::file,
@@ -89,6 +95,9 @@ pub struct PimdirIndexRefreshOptions {
     /// first batch boundary past it with the cursor at that boundary.
     /// `None` folds the whole feed.
     pub deadline: Option<Instant>,
+    /// The instant the horizon is drawn around (SEARCH §7), Unix seconds;
+    /// `None` for the clock's.
+    pub now: Option<i64>,
 }
 
 impl Default for PimdirIndexRefreshOptions {
@@ -96,6 +105,7 @@ impl Default for PimdirIndexRefreshOptions {
         Self {
             batch: 256,
             deadline: None,
+            now: None,
         }
     }
 }
@@ -107,6 +117,10 @@ pub struct PimdirIndexReport {
     pub folded: u64,
     /// Bodies extracted and indexed for the first time.
     pub indexed: u64,
+    /// Calendar items whose occurrences were expanded (SEARCH §7).
+    pub expanded: u64,
+    /// Calendar items cut at `OCCURRENCES_MAX` occurrences.
+    pub bounded: u64,
     /// Placements dropped: deleted, retained, purged or renamed away.
     pub removed: u64,
     /// Whether the key reconciliation ran (SEARCH §4).
@@ -377,6 +391,17 @@ impl PimdirIndex {
                 .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(2)?, r.get(3)?)))?;
         let batch = options.batch.max(1);
         let blobs = self.reader.blobs();
+        let now = options.now.unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs() as i64)
+        });
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let horizon = occurrence::roll(&tx, &blobs, now, &mut report)?;
+        tx.commit().map_err(busy_or_sql)?;
 
         loop {
             if options
@@ -400,7 +425,7 @@ impl PimdirIndex {
             trace!("folding {} feed rows", changed.len());
 
             for row in &changed {
-                fold(&tx, &blobs, row, &mut report)?;
+                fold(&tx, &blobs, &horizon, row, &mut report)?;
             }
             report.folded += changed.len() as u64;
 
@@ -429,7 +454,7 @@ impl PimdirIndex {
                 named_params! { ":limit": batch as i64 },
             )?;
             for row in &unread {
-                fold(&tx, &blobs, row, &mut report)?;
+                fold(&tx, &blobs, &horizon, row, &mut report)?;
             }
 
             report.cursor = end.unwrap_or(report.cursor).max(head.changed);
@@ -455,7 +480,7 @@ impl PimdirIndex {
         query: &PimdirQuery,
         options: &PimdirSearchOptions,
     ) -> Result<PimdirSearchOutput, PimdirError> {
-        let mut compiled = Compiled::new(query)?;
+        let mut compiled = Compiled::new(query, self.ends(query)?)?;
         // NOTE: one more than asked, so the page knows whether it is the
         // last without a count.
         let probe = options.limit.saturating_add(1);
@@ -478,7 +503,8 @@ impl PimdirIndex {
                     row.get::<_, String>(6)?,
                 ))
             },
-        )?;
+        )
+        .map_err(unanswerable)?;
         if options.sort == PimdirSearchSort::Name {
             // NOTE: the title folded as STORAGE Annex A.2 folds `fn`,
             // ties to the seq then the account, as the SQL order gave.
@@ -491,7 +517,7 @@ impl PimdirIndex {
         let mut hits = Vec::new();
         for (account, seq, matched, _) in found {
             let (kind, title, placements) = self.placements(account.as_deref(), seq)?;
-            let snippet = self.snippet(&placements, &compiled.words)?;
+            let snippet = self.snippet(&kind, &placements, &compiled.words)?;
             hits.push(PimdirSearchHit {
                 account,
                 seq,
@@ -521,12 +547,15 @@ impl PimdirIndex {
 
     /// How many hits a query has, with what the count could not see.
     pub fn count(&self, query: &PimdirQuery) -> Result<PimdirSearchCountOutput, PimdirError> {
-        let compiled = Compiled::new(query)?;
-        let count: i64 = self.conn.query_row(
-            &compiled.count(),
-            params_from_iter(compiled.params.iter()),
-            |row| row.get(0),
-        )?;
+        let compiled = Compiled::new(query, self.ends(query)?)?;
+        let count: i64 = self
+            .conn
+            .query_row(
+                &compiled.count(),
+                params_from_iter(compiled.params.iter()),
+                |row| row.get(0),
+            )
+            .map_err(unanswerable)?;
 
         Ok(PimdirSearchCountOutput {
             count: count as u64,
@@ -595,6 +624,29 @@ impl PimdirIndex {
         }))
     }
 
+    /// The items each `linked:` term of a query names, every kind each is
+    /// held under (SEARCH §8), as `(kind, link id)` pairs.
+    fn ends(&self, query: &PimdirQuery) -> Result<Ends, PimdirError> {
+        let mut ends = Vec::new();
+        for (term, _) in query.terms() {
+            let PimdirQueryPredicate::Linked { id, .. } = &term.predicate else {
+                continue;
+            };
+            let (seq, link_id) = match id {
+                PimdirQueryId::Seq(seq) => (Some(*seq), None),
+                PimdirQueryId::Link(link_id) => (None, Some(link_id.as_str())),
+            };
+            let named = rows(
+                &self.conn,
+                search::LOAD_ENDS,
+                named_params! { ":seq": seq, ":link_id": link_id },
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            ends.push((id.clone(), named));
+        }
+        Ok(ends)
+    }
+
     /// A hit's kind, title and live placements in the account.
     fn placements(
         &self,
@@ -639,6 +691,7 @@ impl PimdirIndex {
     /// characters around the word.
     fn snippet(
         &self,
+        kind: &str,
         placements: &[PimdirSearchPlacement],
         words: &[String],
     ) -> Result<Option<String>, PimdirError> {
@@ -667,7 +720,13 @@ impl PimdirIndex {
             return Ok(None);
         };
 
-        let extract = PimdirExtract::mail(&blob);
+        let media_type = match PimdirQueryKind::parse(kind) {
+            Some(kind) => compile::media_type(kind),
+            None => kind,
+        };
+        let Some(extract) = PimdirExtract::body(media_type, &blob) else {
+            return Ok(None);
+        };
         let words: Vec<String> = words.iter().map(|word| fold_text(word)).collect();
         let texts: Vec<&str> = chunks
             .iter()
@@ -745,6 +804,26 @@ impl PimdirIndex {
             |r| r.get(0),
         )?;
         coverage.local.unindexed = unindexed as u64;
+
+        // NOTE: a range leaves the horizon when it starts before it or ends
+        // after it, an open side always (SEARCH §8.1); a date term under
+        // `or` or `not` counts as open on both sides.
+        let dated = query
+            .terms()
+            .into_iter()
+            .any(|(term, _)| matches!(term.predicate, PimdirQueryPredicate::Date(_)));
+        let calendar = collections.iter().any(|c| c.kind == "text/calendar");
+        let (start, end): (String, String) =
+            self.conn
+                .query_row(search::LOAD_INDEX_META, [], |r| Ok((r.get(4)?, r.get(5)?)))?;
+        coverage.horizon_left = dated
+            && calendar
+            && (since
+                .as_ref()
+                .is_none_or(|since| since.as_str() < start.as_str())
+                || until
+                    .as_ref()
+                    .is_none_or(|until| until.as_str() > end.as_str()));
         Ok(coverage)
     }
 }
@@ -865,6 +944,7 @@ fn feed(
 fn fold(
     tx: &Transaction,
     blobs: &crate::client::blobs::PimdirBlobs,
+    horizon: &Horizon,
     row: &FeedRow,
     report: &mut PimdirIndexReport,
 ) -> Result<(), PimdirError> {
@@ -878,6 +958,14 @@ fn fold(
     let hash = match &row.object {
         Some(hash) if row.kind != file::KIND => index_object(tx, blobs, row, hash, report)?,
         _ => None,
+    };
+    let calendar = row.kind == "text/calendar";
+    let held: Option<String> = match calendar {
+        true => tx
+            .query_row(search::PLACEMENT_HASH, key, |r| r.get(0))
+            .optional()?
+            .flatten(),
+        false => None,
     };
 
     let id: i64 = tx.query_row(
@@ -908,6 +996,10 @@ fn fold(
                 ":attendee": text.attendee,
             },
         )?;
+    }
+
+    if calendar && held != hash {
+        occurrence::expand(tx, blobs, &row.collection, row.seq, horizon, report)?;
     }
 
     tx.execute(search::REPLACE_FLAGS, key)?;
@@ -1012,9 +1104,10 @@ fn index_object(
     Ok(Some(hash.into()))
 }
 
-/// Extracts an item's text (SEARCH §6): a message's body through the MIME
-/// walk, an unparseable one from what its summary could read; every other
-/// kind, and an item holding no body, from its summary and addresses.
+/// Extracts an item's text (SEARCH §6): a message, a card or a calendar
+/// resource through its parser, an unparseable one from what its summary
+/// could read; a file, and an item holding no body, from its summary and
+/// addresses.
 fn extract(
     conn: &Connection,
     collection: &str,
@@ -1022,13 +1115,11 @@ fn extract(
     kind: &str,
     body: Option<&[u8]>,
 ) -> Result<PimdirExtract, PimdirError> {
-    if let Some(body) = body
-        && kind == "message/rfc822"
+    let parsed = body.and_then(|body| PimdirExtract::body(kind, body));
+    if let Some(extract) = parsed.as_ref()
+        && extract.status != PimdirExtractStatus::Unparseable
     {
-        let extract = PimdirExtract::mail(body);
-        if extract.status != PimdirExtractStatus::Unparseable {
-            return Ok(extract);
-        }
+        return Ok(parsed.unwrap_or_default());
     }
 
     let links = serde_json::to_string(&[link_id])?;
@@ -1048,7 +1139,7 @@ fn extract(
         .collect();
 
     let mut extract = PimdirExtract::summary(summary.as_ref(), &addresses);
-    if body.is_some() && kind == "message/rfc822" {
+    if parsed.is_some() {
         extract.status = PimdirExtractStatus::Unparseable;
     }
     Ok(extract)
@@ -1137,4 +1228,15 @@ fn trim(text: &str, at: usize) -> String {
         snippet.push('…');
     }
     snippet
+}
+
+/// Maps a failure of a compiled query's statement: a busy store stays
+/// [`PimdirError::Busy`], and anything else is
+/// [`PimdirError::Unanswerable`], never a raw SQL error, since the
+/// grammar accepted the query.
+fn unanswerable(err: rusqlite::Error) -> PimdirError {
+    match busy_or_sql(err) {
+        PimdirError::Sql(err) => PimdirError::Unanswerable(err),
+        err => err,
+    }
 }

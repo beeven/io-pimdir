@@ -536,6 +536,9 @@ pub struct CoverageRow {
     /// Whether a server-side search was merged in; always `localOnly`
     /// here.
     pub remote: RemoteRow,
+    /// Whether the date range leaves the horizon calendar occurrences are
+    /// materialised within, a calendar in scope.
+    pub horizon_left: bool,
 }
 
 impl From<&PimdirSearchCoverage> for CoverageRow {
@@ -562,6 +565,7 @@ impl From<&PimdirSearchCoverage> for CoverageRow {
                 PimdirSearchRemote::LocalOnly => RemoteRow::LocalOnly,
                 PimdirSearchRemote::Augmented { exhaustive } => RemoteRow::Augmented { exhaustive },
             },
+            horizon_left: coverage.horizon_left,
         }
     }
 }
@@ -605,6 +609,12 @@ impl fmt::Display for CoverageRow {
         }
         if let RemoteRow::Augmented { exhaustive: false } = self.remote {
             writeln!(f, " - the server answered in part")?;
+        }
+        if self.horizon_left {
+            writeln!(
+                f,
+                " - the range leaves the horizon calendar occurrences are indexed within"
+            )?;
         }
         Ok(())
     }
