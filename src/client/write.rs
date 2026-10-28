@@ -38,7 +38,7 @@ use crate::{
     },
     sql,
     summary::{
-        PimdirAddress, PimdirAddressRole, PimdirSummary,
+        PimdirAddress, PimdirAddressRole, PimdirDerivation, PimdirSummary,
         calendar::{PimdirEventSummary, PimdirJournalSummary, PimdirTaskSummary, PimdirTime},
         contact::PimdirContactSummary,
         file::{self, PimdirFileSummary},
@@ -1698,4 +1698,75 @@ pub(crate) fn binding_from_row(
             shared_object: shared_object.map(PimdirHash),
         },
     ))
+}
+
+/// Writes one body into a collection no source syncs (§14.3), in the
+/// caller's transaction, answering its public id: a time entry of the
+/// local time collection, a card or a calendar item a person keeps on the
+/// device. The item, its summary, its automatic references and the pins
+/// move as a synced write moves them; a held item under the same key takes
+/// the new body, keeping its flags.
+pub(crate) fn put_unbound(
+    conn: &Connection,
+    collection: &str,
+    object: &PimdirObject,
+    derivation: PimdirDerivation,
+) -> Result<i64, PimdirError> {
+    let link = derivation.link_id;
+    let old = read_hub(conn, collection, Some(core::slice::from_ref(&link.0)))?;
+    let prev = old.items.get(&link);
+    let mut item = PimdirHubItem {
+        flags: prev.map(|prev| prev.flags.clone()).unwrap_or_default(),
+        object: Some(object.hash.clone()),
+        summary: derivation.summary,
+        sort_key: derivation.sort_key,
+        level: PimdirLevel::Full,
+        deleted: false,
+        conflicted: false,
+        conflict_object: None,
+        sources: BTreeMap::new(),
+    };
+
+    conn.execute(
+        sql::STORE_OBJECT,
+        named_params! { ":hash": object.hash.0, ":size": object.size as i64 },
+    )?;
+    match prev {
+        None => {
+            insert_item(conn, collection, &link, &mut item)?;
+            write_summary(conn, collection, &link, None, item.summary.as_ref())?;
+            link_references(conn, &link, item.summary.as_ref())?;
+        }
+        Some(prev) => {
+            let columns_moved = !item_columns_eq(prev, &item);
+            if columns_moved {
+                update_item(conn, collection, &link, &item)?;
+            }
+            let summary_moved = write_summary(
+                conn,
+                collection,
+                &link,
+                prev.summary.as_ref(),
+                item.summary.as_ref(),
+            )?;
+            if summary_moved && !columns_moved {
+                conn.execute(
+                    sql::STAMP_ITEM,
+                    named_params! { ":collection": collection, ":link_id": link.0 },
+                )?;
+            }
+            if summary_moved {
+                link_references(conn, &link, item.summary.as_ref())?;
+            }
+        }
+    }
+    let mut new = old.clone();
+    new.items.insert(link.clone(), item);
+    adjust_refcounts(conn, &object_refs(&old), &object_refs(&new))?;
+
+    Ok(conn.query_row(
+        sql::SEQ_BY_LINK,
+        named_params! { ":collection": collection, ":link_id": link.0 },
+        |row| row.get(0),
+    )?)
 }

@@ -28,6 +28,7 @@ use rusqlite::{
 use crate::{
     capability::{PimdirCapability, PimdirRefusal},
     client::{
+        blobs::PimdirBlobs,
         lock::PimdirLock,
         reader::{PimdirReader, collections_json, reference_from_row},
         write::kind_of,
@@ -35,11 +36,20 @@ use crate::{
     codec::{self, PimdirAction, PimdirActionError},
     hash::PimdirHashAlgo,
     hub::{PimdirHub, PimdirHubConflict, PimdirSourceId},
+    object::PimdirObject,
     placement::PimdirLinkId,
     reference::{PimdirEndpoint, PimdirReference, PimdirReferenceOrigin, PimdirReferenceRole},
     sql,
-    summary::file::{self, PimdirFileSummary},
+    summary::{
+        self,
+        file::{self, PimdirFileSummary},
+    },
 };
+
+/// The local time collection's id (§14.3): `U+0001` and `time`, under no
+/// account, a name no server gives a collection, so every owner of a store
+/// finds the same one.
+pub const TIME_COLLECTION: &str = "\u{1}time";
 
 pub mod blobs;
 mod capability;
@@ -381,6 +391,94 @@ impl PimdirStore {
         Ok(seq)
     }
 
+    /// Writes a body into a collection no source syncs (§14.3), answering
+    /// its link id and public id: a time entry of the
+    /// [local time collection](Self::ensure_time_collection), or a card or
+    /// calendar item kept on the device alone.
+    ///
+    /// The key, the summary and the sort key are derived from the body as
+    /// a synced write derives them (Annex A), and the item, its summary,
+    /// its automatic references (§14.2) and its pins are written in one
+    /// transaction. A body under a key the collection holds replaces it,
+    /// the flags kept. [`delete_unbound`](Self::delete_unbound) removes
+    /// it. A collection a source syncs is refused as
+    /// [`PimdirError::Synced`], its items being the source's to write
+    /// (through the queue, §15), and one of another kind than contacts or
+    /// calendars as [`PimdirError::NotUnbound`]: mail is a source's, and
+    /// a file's summary is the caller's ([`put_file`](Self::put_file)).
+    pub fn put_item(
+        &mut self,
+        collection: impl AsRef<str>,
+        body: &[u8],
+    ) -> Result<(PimdirLinkId, i64), PimdirError> {
+        let collection = collection.as_ref();
+        let kind = kind_of(&self.conn, collection)?;
+        let derivation = match kind.split(';').next().unwrap_or_default().trim() {
+            "text/vcard" | "text/calendar" => summary::derive(&kind, body),
+            _ => None,
+        };
+        let Some(derivation) = derivation else {
+            return Err(PimdirError::NotUnbound {
+                collection: collection.into(),
+                kind,
+            });
+        };
+        let object = PimdirObject {
+            hash: self.hash.hash(body),
+            size: body.len(),
+        };
+        let blobs = PimdirBlobs::open(&self.dir, self.hash);
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        let synced = tx
+            .prepare(sql::COLLECTION_SOURCES)?
+            .exists(named_params! { ":collection": collection })?;
+        if synced {
+            return Err(PimdirError::Synced {
+                collection: collection.into(),
+            });
+        }
+        // NOTE: inside the transaction, so no collector runs between the
+        // blob landing and the row pinning it (§5).
+        blobs.write(&object.hash, body)?;
+        let link = derivation.link_id.clone();
+        let seq = write::put_unbound(&tx, collection, &object, derivation)?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok((link, seq))
+    }
+
+    /// Declares the local time collection (§14.3) once and answers its id,
+    /// [`TIME_COLLECTION`]: a calendar collection under no account that no
+    /// source syncs, where time entries kept on the device go through
+    /// [`put_item`](Self::put_item). A reader finds it by the id alone,
+    /// declaring nothing.
+    pub fn ensure_time_collection(&mut self) -> Result<&'static str, PimdirError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(busy_or_sql)?;
+        tx.execute(
+            sql::SET_COLLECTION_KIND,
+            named_params! {
+                ":collection": TIME_COLLECTION,
+                ":account": None::<&str>,
+                ":kind": "text/calendar",
+            },
+        )?;
+        tx.execute(
+            sql::SET_COLLECTION_NAME,
+            named_params! {
+                ":collection": TIME_COLLECTION,
+                ":account": None::<&str>,
+                ":name": "time",
+            },
+        )?;
+        tx.commit().map_err(busy_or_sql)?;
+        Ok(TIME_COLLECTION)
+    }
+
     /// Regroups a collection under `account`, or out of one with `None` (§9.2).
     pub fn set_collection_account(
         &self,
@@ -484,8 +582,9 @@ impl PimdirStore {
 /// Retention (§11): the trash a store keeps, and the only deletes.
 impl PimdirStore {
     /// Deletes an item no source binds (`delete_unbound_item`, §14.3), a
-    /// file of a device folder or a stand-in, releasing its pins, and
-    /// reports whether there was one; a bound item is its source's to
+    /// file of a device folder, a stand-in or an item
+    /// [put](Self::put_item) there, a time entry say, releasing its pins,
+    /// and reports whether there was one; a bound item is its source's to
     /// remove and is left alone.
     pub fn delete_unbound(
         &mut self,
@@ -996,6 +1095,20 @@ pub enum PimdirError {
         /// Its declared kind, empty when undeclared.
         kind: String,
     },
+    /// An item was put into a collection a source syncs (§14.3): its
+    /// items are the source's to write.
+    Synced {
+        /// The collection written to.
+        collection: String,
+    },
+    /// An item was put into a collection of a kind no unbound write
+    /// derives (§14.3): mail, files, or undeclared.
+    NotUnbound {
+        /// The collection written to.
+        collection: String,
+        /// Its declared kind, empty when undeclared.
+        kind: String,
+    },
     /// The store's schema version is not one this crate services.
     Version {
         /// The store's `user_version`.
@@ -1106,6 +1219,14 @@ impl fmt::Display for PimdirError {
             Self::NotFiles { collection, kind } => write!(
                 f,
                 "Pimdir file write refused: collection {collection} holds {kind:?}, not files"
+            ),
+            Self::Synced { collection } => write!(
+                f,
+                "Pimdir unbound write refused: a source syncs collection {collection}"
+            ),
+            Self::NotUnbound { collection, kind } => write!(
+                f,
+                "Pimdir unbound write refused: collection {collection} holds {kind:?}, not contacts or calendar items"
             ),
             Self::Version { found } => write!(
                 f,
