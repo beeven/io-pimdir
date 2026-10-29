@@ -25,7 +25,7 @@ use crate::{
     client::{
         PimdirError,
         producer::{PimdirPendingAction, PimdirProducer},
-        search::{Found, PimdirIndex, PimdirSearchClock, PimdirSearchSort, compile::Compiled},
+        search::{Found, PimdirIndex, PimdirSearchClock, PimdirSearchSort},
     },
     codec::PimdirAction,
     placement::{PimdirFlags, PimdirLinkId},
@@ -196,7 +196,7 @@ impl PimdirIndex {
         debug!("planning a tag adding {add:?} and removing {remove:?}");
 
         let now = clock.now();
-        let mut compiled = Compiled::new(query, self.ends(query)?, now);
+        let mut compiled = self.compile(query, now)?;
         let found = self.found(&mut compiled, PimdirSearchSort::Date, None)?;
 
         let mut pending: BTreeMap<String, Vec<PimdirPendingAction>> = BTreeMap::new();

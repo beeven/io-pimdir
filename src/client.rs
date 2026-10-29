@@ -22,7 +22,8 @@ use std::{
 };
 
 use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Params, Row, TransactionBehavior, named_params,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Params, Row, TransactionBehavior,
+    named_params,
 };
 
 use crate::{
@@ -161,6 +162,47 @@ impl PimdirStore {
     /// owner.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
         Self::open_with_hash(dir, None)
+    }
+
+    /// Opens the existing store rooted at `dir` as its owner only as it
+    /// stands: unlike [`open`](Self::open), it creates, migrates and
+    /// reconciles nothing (§6), so a caller that owns the store for a
+    /// moment (one local write) never rebuilds a store another owner of
+    /// another revision keeps.
+    ///
+    /// Refused, writing nothing, as [`PimdirError::NotCurrent`]: no
+    /// database under `dir` ([`PimdirNotCurrent::Absent`]), a
+    /// `user_version` other than this crate's
+    /// ([`PimdirNotCurrent::Version`]), or a schema whose text differs
+    /// from the canonical one, which `open` would reconcile
+    /// ([`PimdirNotCurrent::Shape`]). Otherwise as `open`: the same lock,
+    /// [`PimdirError::Owned`] at once when another process holds it, and
+    /// the refusals of a damaged store ([`PimdirError::Stale`],
+    /// [`PimdirError::VersionMismatch`], [`PimdirError::HashAlgo`]).
+    pub fn open_current(dir: impl AsRef<Path>) -> Result<Self, PimdirError> {
+        let dir = dir.as_ref();
+        let db = dir.join("pimdir.db");
+        if !db.is_file() {
+            return Err(PimdirError::NotCurrent(PimdirNotCurrent::Absent));
+        }
+
+        let lock = PimdirLock::own(dir)?;
+
+        let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(&db, flags)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 30000;",
+        )?;
+        schema::current(&conn)?;
+        let hash = schema::hash_algo(&conn, None)?;
+
+        Ok(Self {
+            reader: PimdirReader::over(conn, dir.to_path_buf(), hash),
+            lock,
+            account: None,
+        })
     }
 
     /// Opens the store rooted at `dir`, declaring the hash its objects
@@ -1044,6 +1086,27 @@ pub(crate) fn busy_or_sql(err: rusqlite::Error) -> PimdirError {
     }
 }
 
+/// Why [`PimdirStore::open_current`] refused a store: what
+/// [`PimdirStore::open`] would have created, migrated or reconciled (§6).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PimdirNotCurrent {
+    /// No database under the directory.
+    Absent,
+    /// The database's `user_version` is not this crate's: `0` for one no
+    /// migration ran on, above it for a later crate's.
+    Version {
+        /// The store's `PRAGMA user_version`.
+        found: i64,
+    },
+    /// A table, index or trigger whose stored text is not the canonical
+    /// one, or that only one side declares: a store an owner of another
+    /// revision wrote or reconciled.
+    Shape {
+        /// The first such object, by name.
+        object: String,
+    },
+}
+
 /// Everything that can go wrong servicing the store.
 #[derive(Debug)]
 pub enum PimdirError {
@@ -1123,6 +1186,10 @@ pub enum PimdirError {
         /// The version its `store_meta` row records.
         store_meta: i64,
     },
+    /// The store is not one [`PimdirStore::open_current`] owns as it
+    /// stands: only [`PimdirStore::open`] creates, migrates or reconciles
+    /// a store (§6).
+    NotCurrent(PimdirNotCurrent),
     /// The store was created by an earlier draft and lacks a table or a
     /// trigger the current schema declares (§6): recreate it, the draft
     /// offers no migration.
@@ -1243,6 +1310,19 @@ impl fmt::Display for PimdirError {
             } => write!(
                 f,
                 "Pimdir store is corrupt: PRAGMA user_version is {user_version} but store_meta records {store_meta}"
+            ),
+            Self::NotCurrent(PimdirNotCurrent::Absent) => write!(
+                f,
+                "Pimdir store does not exist yet: its owner has to create it first"
+            ),
+            Self::NotCurrent(PimdirNotCurrent::Version { found }) => write!(
+                f,
+                "Pimdir store schema version {found} is not this crate's {}: its owner has to migrate it first",
+                sql::VERSION
+            ),
+            Self::NotCurrent(PimdirNotCurrent::Shape { object }) => write!(
+                f,
+                "Pimdir store schema differs from this crate's at {object}: its owner has to reconcile it first"
             ),
             Self::Stale { missing } => write!(
                 f,

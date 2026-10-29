@@ -52,13 +52,13 @@ use crate::{
     client::{
         PimdirError, busy_or_sql,
         reader::PimdirReader,
-        rows,
+        rows, schema,
         search::{
             compile::{Compiled, Ends},
             extract::{PimdirChunk, PimdirExtract, PimdirExtractStatus},
             occurrence::Horizon,
         },
-        write::{load_addresses, load_summaries, tables_of},
+        write::{PimdirSummaryTable, load_addresses, load_summaries_by, tables_of},
     },
     codec,
     object::PimdirHash,
@@ -544,7 +544,7 @@ impl PimdirIndex {
         options: &PimdirSearchOptions,
     ) -> Result<PimdirSearchOutput, PimdirError> {
         let now = options.clock.now();
-        let mut compiled = Compiled::new(query, self.ends(query)?, now);
+        let mut compiled = self.compile(query, now)?;
         // NOTE: one more than asked, so the page knows whether it is the
         // last without a count.
         let probe = options.limit.saturating_add(1);
@@ -575,7 +575,7 @@ impl PimdirIndex {
         options: &PimdirSearchOptions,
     ) -> Result<PimdirSearchThreadsOutput, PimdirError> {
         let now = options.clock.now();
-        let mut compiled = Compiled::new(query, self.ends(query)?, now);
+        let mut compiled = self.compile(query, now)?;
         let found = self.found(&mut compiled, options.sort, None)?;
 
         let mut groups: Vec<(Option<String>, Vec<Found>)> = Vec::new();
@@ -732,7 +732,7 @@ impl PimdirIndex {
         clock: &PimdirSearchClock,
     ) -> Result<PimdirSearchCountOutput, PimdirError> {
         let now = clock.now();
-        let compiled = Compiled::new(query, self.ends(query)?, now);
+        let compiled = self.compile(query, now)?;
         let count: i64 = self
             .conn
             .query_row(
@@ -882,6 +882,19 @@ impl PimdirIndex {
             },
             snippet,
         })
+    }
+
+    /// A query compiled against the attached store as it stands: its
+    /// `linked:` ends resolved, and the `task_summary` columns an owner
+    /// has not reconciled yet read as `NULL` (STORAGE §6).
+    fn compile(&self, query: &PimdirQuery, now: i64) -> Result<Compiled, PimdirError> {
+        let missing = schema::missing_columns(
+            &self.conn,
+            "store",
+            "task_summary",
+            &schema::TASK_ORGANISATION,
+        )?;
+        Ok(Compiled::new(query, self.ends(query)?, missing, now))
     }
 
     /// The items each `linked:` term of a query names, every kind each is
@@ -1429,11 +1442,21 @@ fn extract(
     }
 
     let links = serde_json::to_string(&[link_id])?;
+    // NOTE: a store whose owner has not reconciled the task columns yet
+    // reads them as NULL (STORAGE §6).
+    let missing =
+        schema::missing_columns(conn, "store", "task_summary", &schema::TASK_ORGANISATION)?;
+    let tasks = schema::nulled(PimdirSummaryTable::Task.load_sql(), &missing);
     let mut summary = None;
     for table in tables_of(kind) {
-        if let Some((_, found)) = load_summaries(conn, table, collection, Some(&links))?
-            .into_iter()
-            .next()
+        let statement = match table {
+            PimdirSummaryTable::Task => tasks.as_str(),
+            table => table.load_sql(),
+        };
+        if let Some((_, found)) =
+            load_summaries_by(conn, statement, table, collection, Some(&links))?
+                .into_iter()
+                .next()
         {
             summary = Some(found);
             break;

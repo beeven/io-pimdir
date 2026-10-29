@@ -328,6 +328,7 @@ impl ItemRestoreCommand {
             link_id: Some(item.link_id.clone()),
             flags: item.flags.clone(),
             object: item.object.clone(),
+            supersedes: None,
         };
         // NOTE: no size, the body being already indexed: the retained row
         // kept its object alive, which is the point of retention.

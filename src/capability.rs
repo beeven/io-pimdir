@@ -12,7 +12,11 @@ use alloc::{
     vec::Vec,
 };
 
-use crate::{codec::PimdirAction, placement::PimdirFlags, summary::calendar};
+use crate::{
+    codec::PimdirAction,
+    placement::PimdirFlags,
+    summary::{PimdirSummary, calendar},
+};
 
 /// Adding a message to a collection (Annex B.1).
 pub const MAIL_MESSAGE_ADD: &str = "mail.message.add";
@@ -96,6 +100,10 @@ pub const CALENDAR_OCCURRENCE_UPDATE: &str = "calendar.occurrence.update";
 pub const CALENDAR_SCHEDULING: &str = "calendar.scheduling";
 /// Creating an online meeting with the resource that asks for one.
 pub const CALENDAR_ONLINE_MEETING: &str = "calendar.online-meeting";
+/// Whether a calendar collection takes VTODO resources (STORAGE §15.6): an
+/// application capability the store reads only where a row states it, `none`
+/// meaning the collection refuses tasks and no row refusing nothing.
+pub const X_VTODO: &str = "x-vtodo";
 /// Replying to an invitation, the `calendar-reply` intent.
 pub const CALENDAR_REPLY: &str = "calendar.reply";
 /// Cancelling an event the account organises, the `calendar-cancel` intent.
@@ -364,6 +372,32 @@ pub fn check(
     Ok(partials)
 }
 
+/// Whether a calendar resource is a VTODO one, the component its master is
+/// (Annex A.3), which `x-vtodo` gates.
+pub fn is_vtodo(body: &[u8]) -> bool {
+    matches!(calendar::derive(body).summary, Some(PimdirSummary::Task(_)))
+}
+
+/// Checks that every source concerned takes a VTODO resource where it
+/// lands (STORAGE §15.6): one stating `x-vtodo` `none` there, or
+/// source-wide, refuses it; one stating nothing, declared or not, does not.
+pub fn check_vtodo(sources: &[PimdirSourceCapabilities]) -> Result<(), PimdirRefusal> {
+    for source in sources {
+        if let Some((PimdirSupport::None, detail)) = source
+            .declared
+            .as_ref()
+            .and_then(|declared| declared.get(X_VTODO))
+        {
+            return Err(PimdirRefusal {
+                capability: X_VTODO.to_string(),
+                source: source.source.clone(),
+                detail: detail.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The domain and object of a collection kind (Annex B).
 fn domain(kind: &str) -> Option<(&'static str, &'static str)> {
     match kind {
@@ -453,6 +487,7 @@ mod tests {
             link_id: None,
             flags: flags(&["\\Draft"]),
             object: None,
+            supersedes: None,
         };
 
         assert_eq!(

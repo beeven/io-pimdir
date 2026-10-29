@@ -391,6 +391,7 @@ fn a_queued_add_stands_for_its_attachments_when_drained() {
                 link_id: Some(PimdirLinkId(LINK.into())),
                 flags: PimdirFlags::from_iter(["\\Draft"]),
                 object: Some(hash.clone()),
+                supersedes: None,
             },
             Some(&PimdirObject {
                 hash,

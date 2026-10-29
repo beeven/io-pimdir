@@ -240,6 +240,9 @@ pub struct PimdirSync {
     local: BTreeMap<PimdirHandle, PimdirPlacement>,
     /// The bindings the open round had not stamped when the page loaded.
     unstamped: Vec<PimdirHandle>,
+    /// The tombstones whose remove is held while the add superseding them
+    /// is pending (SYNC §5).
+    held: BTreeSet<PimdirHandle>,
     /// The meta each listed member carried, by handle.
     metas: BTreeMap<PimdirHandle, PimdirRemoteMeta>,
     /// The members the page named, landed or refreshed, which the join
@@ -307,6 +310,7 @@ impl PimdirSync {
             landing: None,
             local: BTreeMap::new(),
             unstamped: Vec::new(),
+            held: BTreeSet::new(),
             metas: BTreeMap::new(),
             fresh: BTreeMap::new(),
             holds_creates: false,
@@ -597,6 +601,7 @@ impl PimdirSync {
         });
         self.local.clear();
         self.unstamped.clear();
+        self.held.clear();
 
         self.state = State::LoadingPage;
         PimdirCoroutineState::Yielded(PimdirYield::WantsLoad {
@@ -613,6 +618,7 @@ impl PimdirSync {
                 .or_insert(placement);
         }
         self.unstamped.extend(loaded.unstamped);
+        self.held.extend(loaded.held);
     }
 
     /// The hints a page before the last loads the holders of, so naming
@@ -1202,6 +1208,13 @@ impl PimdirSync {
                     self.revive(&local, item);
                     self.report.pulled += 1;
                     self.emit(PimdirSyncEvent::Added(handle.clone()));
+                    return None;
+                }
+
+                // NOTE: an add superseded this tombstone and its create is
+                // still pending: no delete, nor the edit a move rides ahead
+                // on, reaches the server before it lands (SYNC §5).
+                if self.held.contains(&handle) {
                     return None;
                 }
 

@@ -48,4 +48,8 @@ pub struct PimdirLoaded {
     /// scope or unknown (`list_unstamped_bindings`), the members its last
     /// page finds absent unless that page lists them.
     pub unstamped: Vec<PimdirHandle>,
+    /// The handles of the loaded tombstones whose remove is held: an add
+    /// superseded them and the item it created is still a pending create
+    /// (`list_superseded_pending`, STORAGE §15.3, SYNC §5).
+    pub held: Vec<PimdirHandle>,
 }

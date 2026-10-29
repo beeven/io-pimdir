@@ -11,7 +11,7 @@ use std::{collections::BTreeMap, path::Path};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, named_params, params};
 
 use crate::{
-    client::{PimdirError, blobs::PimdirBlobs, busy_or_sql, rows},
+    client::{PimdirError, PimdirNotCurrent, blobs::PimdirBlobs, busy_or_sql, rows},
     codec,
     hash::PimdirHashAlgo,
     object::PimdirHash,
@@ -110,12 +110,7 @@ fn reconcile(conn: &mut Connection, blobs: &PimdirBlobs) -> Result<(), PimdirErr
     }
     let wanted = objects(&canonical)?;
     let held = objects(conn)?;
-    let current = wanted.len() == held.len()
-        && wanted.iter().all(|(name, object)| {
-            held.get(name)
-                .is_some_and(|held| normalised(&held.sql) == normalised(&object.sql))
-        });
-    if current {
+    if first_difference(&wanted, &held).is_none() {
         return Ok(());
     }
 
@@ -372,6 +367,42 @@ fn objects(conn: &Connection) -> Result<BTreeMap<String, PimdirSchemaObject>, Pi
     Ok(declared.into_iter().collect())
 }
 
+/// The first table, index or trigger by name whose stored text differs
+/// from its canonical one, or that only one side holds: what [`reconcile`]
+/// would rebuild, create or drop (§6); `None` for a current store.
+fn first_difference(
+    wanted: &BTreeMap<String, PimdirSchemaObject>,
+    held: &BTreeMap<String, PimdirSchemaObject>,
+) -> Option<String> {
+    let differs = wanted.iter().find(|(name, object)| {
+        held.get(*name)
+            .is_none_or(|held| normalised(&held.sql) != normalised(&object.sql))
+    });
+    let extra = || held.keys().find(|name| !wanted.contains_key(*name));
+    differs.map(|(name, _)| name).or_else(extra).cloned()
+}
+
+/// Checks, changing nothing, that the store is the one this crate writes
+/// as it stands: at the current `user_version`, every core table present
+/// with agreeing stamps ([`check`]), and its schema text the canonical one,
+/// so that [`init`] would migrate and reconcile nothing (§6).
+pub(crate) fn current(conn: &Connection) -> Result<(), PimdirError> {
+    let found: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+    if found != sql::VERSION {
+        return Err(PimdirError::NotCurrent(PimdirNotCurrent::Version { found }));
+    }
+    check(conn)?;
+
+    let canonical = Connection::open_in_memory()?;
+    for migration in sql::MIGRATIONS {
+        canonical.execute_batch(migration)?;
+    }
+    match first_difference(&objects(&canonical)?, &objects(conn)?) {
+        Some(object) => Err(PimdirError::NotCurrent(PimdirNotCurrent::Shape { object })),
+        None => Ok(()),
+    }
+}
+
 /// A declaring statement as §6 compares it: every `--` comment dropped and
 /// whitespace collapsed to single spaces.
 fn normalised(sql: &str) -> String {
@@ -418,6 +449,73 @@ pub(crate) fn has_column(
         .optional()?
         .is_some())
 }
+
+/// The `task_summary` columns a later draft added (Annex A.4), which a
+/// store its owner has not reconciled yet lacks (§6): the shape an owner
+/// at io-pimdir 3b4bed8 keeps.
+pub(crate) const TASK_ORGANISATION: [&str; 4] = ["priority", "categories", "parent", "mid"];
+
+/// The columns among `columns` that `table` of the database `schema`
+/// (`main`, or an attached one) lacks, in the order given.
+pub(crate) fn missing_columns(
+    conn: &Connection,
+    schema: &str,
+    table: &str,
+    columns: &[&'static str],
+) -> Result<Vec<&'static str>, PimdirError> {
+    let held: Vec<String> = rows(
+        conn,
+        "SELECT name FROM pragma_table_info(?1, ?2)",
+        [table, schema],
+        |row| row.get(0),
+    )?;
+    Ok(columns
+        .iter()
+        .copied()
+        .filter(|column| !held.iter().any(|held| held == column))
+        .collect())
+}
+
+/// A statement reading every one of `columns` as `NULL`, so a reader
+/// meeting a store that lacks them runs no statement naming them (§6).
+///
+/// Each identifier equal to one of `columns`, bare or qualified by a table
+/// alias (`s.priority`), becomes `NULL`; a bound parameter (`:mid`) and
+/// any other word are kept.
+pub(crate) fn nulled(statement: &str, columns: &[&str]) -> String {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(statement.len());
+    let mut rest = statement;
+    let mut previous: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        let starts = word(c) && !previous.is_some_and(|p| word(p) || matches!(p, ':' | '@' | '$'));
+        if !starts {
+            out.push(c);
+            previous = Some(c);
+            rest = &rest[c.len_utf8()..];
+            continue;
+        }
+        let first = rest.find(|c: char| !word(c)).unwrap_or(rest.len());
+        let mut end = first;
+        let mut column = &rest[..first];
+        if let Some(after) = rest[first..].strip_prefix('.')
+            && after.starts_with(word)
+        {
+            let second = after.find(|c: char| !word(c)).unwrap_or(after.len());
+            column = &after[..second];
+            end = first + 1 + second;
+        }
+        if columns.contains(&column) {
+            out.push_str("NULL");
+        } else {
+            out.push_str(&rest[..end]);
+        }
+        previous = rest[..end].chars().last();
+        rest = &rest[end..];
+    }
+    out
+}
+
 /// Refuses a store stamped at the current version that this crate does
 /// not read: an earlier draft's shape, or disagreeing stamps (§4.2).
 ///
@@ -493,5 +591,35 @@ pub(crate) fn hash_algo(
             declared: Some(declared.as_str()),
         }),
         _ => Ok(algo),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::nulled;
+
+    #[test]
+    fn a_missing_column_reads_as_null_bare_or_qualified() {
+        let columns = ["priority", "mid"];
+        assert_eq!(
+            nulled("SELECT s.until, s.priority, s.mid FROM t s", &columns),
+            "SELECT s.until, NULL, NULL FROM t s"
+        );
+        assert_eq!(
+            nulled("SELECT until, priority, mid\nFROM t -- §6", &columns),
+            "SELECT until, NULL, NULL\nFROM t -- §6"
+        );
+    }
+
+    #[test]
+    fn a_parameter_or_a_longer_word_is_kept() {
+        let columns = ["mid"];
+        assert_eq!(
+            nulled(
+                "WHERE amid = :mid AND mid_x = @mid AND x.mid IS NULL",
+                &columns
+            ),
+            "WHERE amid = :mid AND mid_x = @mid AND NULL IS NULL"
+        );
     }
 }

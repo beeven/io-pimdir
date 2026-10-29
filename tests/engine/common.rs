@@ -77,6 +77,11 @@ where
         Self { store, remote, dir }
     }
 
+    /// The store's directory, for a producer opened beside this owner.
+    pub fn path(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
     pub fn remote(&self) -> &R {
         &self.remote
     }

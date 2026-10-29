@@ -30,7 +30,7 @@ use crate::{
         reader::{PimdirItem, item_from_row},
         record_receipt, rows, schema, write,
     },
-    codec::{self, PimdirAction, PimdirActionError},
+    codec::{self, PimdirAction, PimdirActionError, PimdirSupersedes},
     collection::PimdirCollectionId,
     coroutine::*,
     hash::{PimdirHashAlgo, PimdirHasher},
@@ -620,6 +620,22 @@ impl PimdirSourceStore {
             _ => None,
         };
         write::apply(&tx, &blobs, &source, self.store.account.as_deref(), ops)?;
+        // NOTE: the item an add supersedes is tombstoned in the transaction
+        // applying it, after its duplicate check parked nothing (§15.3).
+        if let (
+            PimdirAction::Add {
+                supersedes: Some(superseded),
+                ..
+            },
+            Some(link),
+        ) = (action, &created)
+        {
+            let account = self.store.account.as_deref();
+            let by = (collection, link);
+            if let Err(outcome) = supersede(&tx, &blobs, &self.source, account, superseded, by)? {
+                return Ok(outcome);
+            }
+        }
         if let Some(hash) = &row.object_hash {
             tx.execute(
                 sql::ADJUST_REFCOUNT,
@@ -640,6 +656,66 @@ impl PimdirSourceStore {
         tx.commit().map_err(busy_or_sql)?;
         Ok(PimdirOutcome::Applied)
     }
+}
+
+/// Tombstones the item an `add` supersedes, inside the drain transaction
+/// that applied the add, and records the pair (§15.3, `supersede_item`):
+/// as a `remove` of it, staged as the source binding it, or retained at
+/// once when no source binds it, nothing having a delete to push. An item
+/// already gone is no failure, nor one the add itself revived under its
+/// key; a remove that cannot be staged parks the whole action, its add
+/// with it, the transaction dropped unapplied.
+fn supersede(
+    tx: &Connection,
+    blobs: &PimdirBlobs,
+    own: &PimdirSourceId,
+    account: Option<&str>,
+    superseded: &PimdirSupersedes,
+    (by_collection, by_link): (&str, &PimdirLinkId),
+) -> Result<Result<(), PimdirOutcome>, PimdirError> {
+    let collection = superseded.collection.0.as_str();
+    let item: Option<PimdirItem> = tx
+        .query_row(
+            sql::GET_ITEM,
+            named_params! { ":collection": collection, ":seq": superseded.seq },
+            item_from_row,
+        )
+        .optional()?;
+    let Some(item) = item else {
+        return Ok(Ok(()));
+    };
+    if collection == by_collection && item.link_id == *by_link {
+        return Ok(Ok(()));
+    }
+
+    let acting = acting_source(tx, own, collection)?;
+    let remove = PimdirAction::Remove {
+        seq: superseded.seq,
+    };
+    match stage_action(tx, blobs, &acting, collection, &remove)? {
+        Ok((source, ops)) => write::apply(tx, blobs, &source, account, ops)?,
+        Err(PimdirOutcome::Skipped) => {
+            tx.execute(
+                sql::RETAIN_ITEM,
+                named_params! {
+                    ":collection": collection,
+                    ":link_id": item.link_id.0,
+                    ":source": acting.0,
+                },
+            )?;
+        }
+        Err(outcome) => return Ok(Err(outcome)),
+    }
+    tx.execute(
+        sql::SUPERSEDE_ITEM,
+        named_params! {
+            ":collection": collection,
+            ":link_id": item.link_id.0,
+            ":by_collection": by_collection,
+            ":by_link_id": by_link.0,
+        },
+    )?;
+    Ok(Ok(()))
 }
 
 /// Whether a failure is the environment's rather than the store's (§15.2):
@@ -714,6 +790,7 @@ fn stage_action(
         link_id,
         flags,
         object,
+        ..
     } = action
     {
         let derivation = match object {

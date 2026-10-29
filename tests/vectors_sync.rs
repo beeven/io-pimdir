@@ -216,6 +216,19 @@ fn seed(dir: &Path, spec: &Path, store: &Value) -> Bodies {
         )
         .unwrap();
     }
+    // NOTE: what an add carrying `supersedes` recorded (STORAGE §15.3).
+    for pair in store["supersessions"].as_array().into_iter().flatten() {
+        conn.execute(
+            sql::SUPERSEDE_ITEM,
+            named_params! {
+                ":collection": pair["collection"].as_str().unwrap(),
+                ":link_id": pair["link_id"].as_str().unwrap(),
+                ":by_collection": pair["by_collection"].as_str().unwrap(),
+                ":by_link_id": pair["by_link_id"].as_str().unwrap(),
+            },
+        )
+        .unwrap();
+    }
     for binding in store["bindings"].as_array().unwrap() {
         if let Some(round) = binding.get("round") {
             conn.execute(
@@ -828,6 +841,9 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
         "references" => {
             "SELECT from_kind, from_link_id, to_kind, to_link_id, role, origin FROM item_reference ORDER BY from_kind, from_link_id, to_kind, to_link_id, role"
         }
+        "supersessions" => {
+            "SELECT collection, link_id, by_collection, by_link_id FROM supersessions ORDER BY collection, link_id"
+        }
         _ => panic!("unknown table {table}"),
     };
 
@@ -922,6 +938,12 @@ fn actual_rows(conn: &Connection, bodies: &Bodies, table: &str, expected: &[Valu
                     get("to_link_id", json!(row.get::<_, String>(3)?));
                     get("role", json!(row.get::<_, String>(4)?));
                     get("origin", json!(row.get::<_, String>(5)?));
+                }
+                "supersessions" => {
+                    get("collection", json!(row.get::<_, String>(0)?));
+                    get("link_id", json!(row.get::<_, String>(1)?));
+                    get("by_collection", json!(row.get::<_, String>(2)?));
+                    get("by_link_id", json!(row.get::<_, String>(3)?));
                 }
                 _ => unreachable!(),
             }

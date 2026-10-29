@@ -87,6 +87,16 @@ pub fn conflict_from_str(value: &str) -> PimdirHubConflict {
     }
 }
 
+/// The item an `add` replaces (STORAGE §15.3): a task filed into another
+/// collection, renamed or not, rather than moved there.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PimdirSupersedes {
+    /// The collection holding it.
+    pub collection: PimdirCollectionId,
+    /// Its public id there.
+    pub seq: i64,
+}
+
 /// A queued mutation request (STORAGE §15.3).
 ///
 /// What a producer appends and the owner applies, existing items
@@ -104,6 +114,9 @@ pub enum PimdirAction {
         flags: PimdirFlags,
         /// The body's hash, written durably by the producer before enqueueing.
         object: Option<PimdirHash>,
+        /// The item this one replaces (§15.3): applied with its tombstone in
+        /// one transaction, its delete held until this add is pushed.
+        supersedes: Option<PimdirSupersedes>,
     },
     /// Replace the item's flag set, absolutely.
     SetFlags {
@@ -244,6 +257,7 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             link_id,
             flags,
             object,
+            supersedes,
         } => {
             if let Some(link) = link_id {
                 map.insert("link_id".into(), json!(link.0));
@@ -251,6 +265,12 @@ pub fn action_to_payload(action: &PimdirAction) -> String {
             map.insert("flags".into(), flags_to_value(flags));
             if let Some(object) = object {
                 map.insert("object".into(), json!(object.0));
+            }
+            if let Some(supersedes) = supersedes {
+                map.insert(
+                    "supersedes".into(),
+                    json!({ "collection": supersedes.collection.0, "seq": supersedes.seq }),
+                );
             }
         }
         PimdirAction::SetFlags { seq, flags } => {
@@ -296,6 +316,7 @@ pub fn action_from_payload(kind: &str, payload: &str) -> Result<PimdirAction, Pi
             link_id: get_string(map, "link_id")?.map(PimdirLinkId),
             flags: flags_from_value(map.get("flags")),
             object: get_string(map, "object")?.map(PimdirHash),
+            supersedes: get_supersedes(map)?,
         }),
         "set-flags" => Ok(PimdirAction::SetFlags {
             seq: require_seq(map)?,
@@ -375,6 +396,25 @@ fn require_string(
     get_string(map, field)?.ok_or(PimdirActionError::MissingField(field))
 }
 
+/// An `add`'s `supersedes`, strictly: absent is none, anything but an
+/// object naming a collection and a seq is malformed and parks the row.
+fn get_supersedes(map: &Map<String, Value>) -> Result<Option<PimdirSupersedes>, PimdirActionError> {
+    let Some(value) = map.get("supersedes") else {
+        return Ok(None);
+    };
+    let field = PimdirActionError::MissingField("supersedes");
+    let inner = value.as_object().ok_or(field.clone())?;
+    let collection = inner
+        .get("collection")
+        .and_then(Value::as_str)
+        .ok_or(field.clone())?;
+    let seq = inner.get("seq").and_then(Value::as_i64).ok_or(field)?;
+    Ok(Some(PimdirSupersedes {
+        collection: PimdirCollectionId(collection.to_string()),
+        seq,
+    }))
+}
+
 fn require_seq(map: &Map<String, Value>) -> Result<i64, PimdirActionError> {
     map.get("seq")
         .and_then(Value::as_i64)
@@ -424,17 +464,45 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_supersedes_is_refused_and_an_absent_one_is_none() {
+        for payload in [
+            r#"{"v":1,"flags":[],"supersedes":"inbox"}"#,
+            r#"{"v":1,"flags":[],"supersedes":{"seq":3}}"#,
+            r#"{"v":1,"flags":[],"supersedes":{"collection":"inbox","seq":"3"}}"#,
+        ] {
+            assert_eq!(
+                action_from_payload("add", payload),
+                Err(PimdirActionError::MissingField("supersedes")),
+                "{payload}"
+            );
+        }
+        let plain = action_from_payload("add", r#"{"v":1,"flags":[]}"#).unwrap();
+        assert!(matches!(
+            plain,
+            PimdirAction::Add {
+                supersedes: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn every_action_kind_round_trips_through_its_payload() {
         let actions = [
             PimdirAction::Add {
                 link_id: Some(PimdirLinkId("mid:new".into())),
                 flags: PimdirFlags::from_iter(["\\Draft"]),
                 object: Some(PimdirHash("cafebabe".into())),
+                supersedes: None,
             },
             PimdirAction::Add {
                 link_id: None,
                 flags: PimdirFlags::default(),
                 object: None,
+                supersedes: Some(PimdirSupersedes {
+                    collection: PimdirCollectionId("Inbox".into()),
+                    seq: 3,
+                }),
             },
             PimdirAction::SetFlags {
                 seq: 4,

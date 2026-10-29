@@ -36,7 +36,7 @@ use crate::{
         rows, schema,
         write::{
             PimdirSummaryTable, attach_address, binding_from_row, kind_of, load_addresses,
-            load_summaries, tables_of,
+            load_summaries_by, tables_of,
         },
     },
     codec::{self, PimdirAction},
@@ -559,6 +559,23 @@ impl PimdirReader {
     /// A collection listing as the store can answer it: one whose owner has
     /// not reconciled `collections.role` or the coverage columns yet reads
     /// them as `NULL` (§6).
+    /// A `task_summary` read as the store can answer it: one whose owner
+    /// has not reconciled the task organisation columns yet (`priority`,
+    /// `categories`, `parent`, `mid`, an owner at io-pimdir 3b4bed8) reads
+    /// each it lacks as `NULL` (§6), so its categories as none.
+    fn task_sql(&self, statement: &str) -> Result<String, PimdirError> {
+        let missing = schema::missing_columns(
+            &self.conn,
+            "main",
+            "task_summary",
+            &schema::TASK_ORGANISATION,
+        )?;
+        Ok(match missing.is_empty() {
+            true => statement.to_string(),
+            false => schema::nulled(statement, &missing),
+        })
+    }
+
     fn collections_sql(&self, statement: &'static str) -> Result<String, PimdirError> {
         let mut statement = String::from(statement);
         if !schema::has_column(&self.conn, "collections", "role")? {
@@ -691,6 +708,7 @@ impl PimdirReader {
         let kind = kind_of(&self.conn, collection)?;
         let tables = tables_of(&kind);
         let descending = kind.starts_with("message/rfc822");
+        let tasks = self.task_sql(sql::LIST_TASKS_PAGE_ASC)?;
         let statements: Vec<(&str, PimdirSummaryTable)> =
             match kind.split(';').next().unwrap_or_default().trim() {
                 "message/rfc822" => vec![(sql::LIST_MAIL_PAGE_DESC, PimdirSummaryTable::Mail)],
@@ -698,7 +716,7 @@ impl PimdirReader {
                 file::KIND => vec![(sql::LIST_FILES_PAGE_ASC, PimdirSummaryTable::File)],
                 "text/calendar" => vec![
                     (sql::LIST_EVENTS_PAGE_ASC, PimdirSummaryTable::Event),
-                    (sql::LIST_TASKS_PAGE_ASC, PimdirSummaryTable::Task),
+                    (tasks.as_str(), PimdirSummaryTable::Task),
                     (sql::LIST_JOURNALS_PAGE_ASC, PimdirSummaryTable::Journal),
                 ],
                 _ => return self.list_items_page_asc(collection, after, limit),
@@ -1012,6 +1030,46 @@ impl PimdirReader {
         Ok(placements.into_iter().flatten().collect())
     }
 
+    /// Which of `message_ids` some live mail of the store replies to, its
+    /// `In-Reply-To` naming the id (`list_replied`): a waiting task whose
+    /// source mail (its `mid`) was answered. Mail under the `sent` or
+    /// `drafts` role is the person's own and answers nothing.
+    ///
+    /// Ids compare bare and exactly, as Annex A.1 stores `in_reply_to` and
+    /// A.4 a task's `mid`: each one given is trimmed and stripped of one pair
+    /// of enclosing angle brackets, an empty one dropped. The answer holds
+    /// each id answered once, bare, in code point order. A scan of every
+    /// mail summary.
+    pub fn replied(&self, message_ids: &[String]) -> Result<Vec<String>, PimdirError> {
+        let ids: Vec<&str> = message_ids
+            .iter()
+            .map(|id| {
+                let id = id.trim();
+                id.strip_prefix('<')
+                    .and_then(|id| id.strip_suffix('>'))
+                    .unwrap_or(id)
+                    .trim()
+            })
+            .filter(|id| !id.is_empty())
+            .collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // NOTE: a store whose owner has not reconciled `collections.role`
+        // yet reads it as NULL (§6), every mail then answering.
+        let mut statement = String::from(sql::LIST_REPLIED);
+        if !schema::has_column(&self.conn, "collections", "role")? {
+            statement = schema::nulled(&statement, &["role"]);
+        }
+        Ok(rows(
+            &self.conn,
+            &statement,
+            named_params! { ":ids": serde_json::to_string(&ids)? },
+            |r| r.get(0),
+        )?)
+    }
+
     /// The same for one domain, by a scan.
     pub fn domain_placements(
         &self,
@@ -1111,6 +1169,16 @@ impl PimdirReader {
         collection: impl AsRef<str>,
     ) -> Result<Vec<PimdirSourceCapabilities>, PimdirError> {
         capability::at_collection(&self.conn, collection.as_ref())
+    }
+
+    /// Whether `collection` takes tasks (§15.6): `false` when a source
+    /// syncing it states `x-vtodo` `none` there or source-wide, `true`
+    /// otherwise, a source stating nothing refusing nothing. What a client
+    /// reads before offering a calendar as a task list or capturing into it;
+    /// the gate refuses the same add.
+    pub fn accepts_vtodo(&self, collection: impl AsRef<str>) -> Result<bool, PimdirError> {
+        let sources = capability::at_collection(&self.conn, collection.as_ref())?;
+        Ok(crate::capability::check_vtodo(&sources).is_ok())
     }
 
     /// What every source binding the item `seq` of `collection` can do
@@ -1857,11 +1925,12 @@ impl PimdirReader {
     ) -> Result<Option<PimdirItem>, PimdirError> {
         let kind = kind_of(&self.conn, collection)?;
         let tables = tables_of(&kind);
+        let task = self.task_sql(sql::GET_TASK)?;
         let statement = |table: PimdirSummaryTable| match table {
             PimdirSummaryTable::Mail => sql::GET_MAIL,
             PimdirSummaryTable::Contact => sql::GET_CONTACT,
             PimdirSummaryTable::Event => sql::GET_EVENT,
-            PimdirSummaryTable::Task => sql::GET_TASK,
+            PimdirSummaryTable::Task => task.as_str(),
             PimdirSummaryTable::Journal => sql::GET_JOURNAL,
             PimdirSummaryTable::File => sql::GET_FILE,
         };
@@ -1906,8 +1975,15 @@ impl PimdirReader {
         let tables = tables_of(&kind_of(&self.conn, collection)?);
         let links: Vec<String> = items.iter().map(|item| item.link_id.0.clone()).collect();
         let scope = serde_json::to_string(&links)?;
+        let tasks = self.task_sql(PimdirSummaryTable::Task.load_sql())?;
         for table in &tables {
-            for (link, summary) in load_summaries(&self.conn, *table, collection, Some(&scope))? {
+            let statement = match table {
+                PimdirSummaryTable::Task => tasks.as_str(),
+                table => table.load_sql(),
+            };
+            for (link, summary) in
+                load_summaries_by(&self.conn, statement, *table, collection, Some(&scope))?
+            {
                 if let Some(item) = items.iter_mut().find(|item| item.link_id == link) {
                     item.summary = Some(summary);
                 }
@@ -1970,6 +2046,19 @@ impl PimdirReader {
                 }
                 PimdirAction::Copy { seq, to } if !here && to.0 == collection => {
                     pending.arrivals.insert(*seq, from);
+                }
+                // NOTE: the item a pending add supersedes reads as removed,
+                // as it will be once the add is applied (§15.3).
+                PimdirAction::Add {
+                    supersedes: Some(superseded),
+                    ..
+                } if superseded.collection.0 == collection => {
+                    let seq = superseded.seq;
+                    pending
+                        .edits
+                        .entry(seq)
+                        .or_default()
+                        .push(PimdirAction::Remove { seq });
                 }
                 _ => {}
             }

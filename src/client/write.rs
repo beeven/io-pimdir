@@ -117,12 +117,33 @@ impl PimdirSourceStore {
             _ => Vec::new(),
         };
 
+        // NOTE: on every scope, so a delta's synthesized candidate and a
+        // page's listed member both see the hold (SYNC §5).
+        let superseded: Vec<String> = rows(
+            conn,
+            sql::LIST_SUPERSEDED_PENDING,
+            named_params! { ":collection": collection.0 },
+            |r| r.get(0),
+        )?;
+        let held = placements
+            .iter()
+            .filter(|placement| placement.status == PimdirStatus::Tombstone)
+            .filter(|placement| {
+                placement
+                    .link_id
+                    .as_ref()
+                    .is_some_and(|link| superseded.contains(&link.0))
+            })
+            .map(|placement| placement.handle.clone())
+            .collect();
+
         Ok(PimdirLoaded {
             placements,
             checkpoint: state.checkpoint,
             coverage: state.coverage,
             round: state.round,
             unstamped,
+            held,
         })
     }
 
@@ -758,7 +779,7 @@ impl PimdirSummaryTable {
         }
     }
 
-    fn load_sql(self) -> &'static str {
+    pub(crate) fn load_sql(self) -> &'static str {
         match self {
             Self::Mail => sql::LOAD_MAIL_SUMMARIES,
             Self::Contact => sql::LOAD_CONTACT_SUMMARIES,
@@ -914,9 +935,21 @@ pub(crate) fn load_summaries(
     collection: &str,
     links: Option<&str>,
 ) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirSummary)>> {
+    load_summaries_by(conn, table.load_sql(), table, collection, links)
+}
+
+/// [`load_summaries`] through `statement`, a load of `table` as a reader
+/// rewrote it for the columns its store lacks (§6).
+pub(crate) fn load_summaries_by(
+    conn: &Connection,
+    statement: &str,
+    table: PimdirSummaryTable,
+    collection: &str,
+    links: Option<&str>,
+) -> rusqlite::Result<Vec<(PimdirLinkId, PimdirSummary)>> {
     let loaded = rows(
         conn,
-        table.load_sql(),
+        statement,
         named_params! { ":collection": collection, ":links": links },
         |row| Ok((PimdirLinkId(row.get(0)?), table.read_row(row, 1)?)),
     )?;

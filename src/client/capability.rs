@@ -199,10 +199,25 @@ pub(crate) fn gate(
     action: &PimdirAction,
 ) -> Result<Vec<PimdirPartial>, PimdirError> {
     let kind = write::kind_of(conn, collection)?;
-    let partials = gate_by_kind(conn, &kind, collection, action)?;
+    let mut partials = gate_by_kind(conn, &kind, collection, action)?;
+
+    // NOTE: an add superseding an item also removes it (§15.3), which its
+    // own sources gate, its scheduled attendees included.
+    if let PimdirAction::Add {
+        supersedes: Some(superseded),
+        ..
+    } = action
+    {
+        let remove = PimdirAction::Remove {
+            seq: superseded.seq,
+        };
+        partials.extend(gate(conn, blobs, &superseded.collection.0, &remove)?);
+    }
+
     if kind != "text/calendar" {
         return Ok(partials);
     }
+    gate_vtodo(conn, blobs, collection, action)?;
 
     // NOTE: a calendar write also needs what its resources ask for
     // (Annex B.1), read from the bodies the producer wrote before the
@@ -231,9 +246,44 @@ pub(crate) fn gate(
         }
         _ => at_collection(conn, collection)?,
     };
-    let mut partials = partials;
     partials.extend(capability::check(&needed, &sources)?);
     Ok(partials)
+}
+
+/// Refuses a VTODO resource landing in a calendar collection a source
+/// concerned states `x-vtodo` `none` for (§15.6): the new body of an `add`
+/// or `update` in its collection, the item's of a `move` or `copy` in the
+/// target. Every other action, and every other component, passes.
+fn gate_vtodo(
+    conn: &Connection,
+    blobs: &PimdirBlobs,
+    collection: &str,
+    action: &PimdirAction,
+) -> Result<(), PimdirError> {
+    let (body, sources) = match action {
+        PimdirAction::Add {
+            object: Some(hash), ..
+        } => (blobs.get(hash)?, None),
+        PimdirAction::Update { seq, object } => {
+            (blobs.get(object)?, Some(at_item(conn, collection, *seq)?))
+        }
+        PimdirAction::Move { seq, to } | PimdirAction::Copy { seq, to } => {
+            let body = match item_object(conn, collection, *seq)? {
+                Some(hash) => blobs.get(&hash)?,
+                None => None,
+            };
+            (body, Some(at_collection(conn, &to.0)?))
+        }
+        _ => return Ok(()),
+    };
+    if !body.as_deref().is_some_and(capability::is_vtodo) {
+        return Ok(());
+    }
+    let sources = match sources {
+        Some(sources) => sources,
+        None => at_collection(conn, collection)?,
+    };
+    Ok(capability::check_vtodo(&sources)?)
 }
 
 /// The gate of the capabilities an action needs by its kind and flags
@@ -332,6 +382,7 @@ fn gate_by_kind(
                     link_id: None,
                     flags: current,
                     object: None,
+                    supersedes: None,
                 };
                 let needed = capability::required(kind, &arriving, &PimdirFlags::Unknown);
                 let others: Vec<_> = at_collection(conn, &to.0)?

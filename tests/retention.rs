@@ -272,6 +272,7 @@ fn a_queued_add_restores_a_retained_item() {
                 link_id: Some(retained.link_id.clone()),
                 flags: retained.flags.clone(),
                 object: retained.object.clone(),
+                supersedes: None,
             },
             None,
         )

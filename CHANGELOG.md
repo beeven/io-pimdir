@@ -48,15 +48,21 @@ All notable changes to this project are documented in this file. The format is b
   - A rejected head position restarts the round over the run's scope.
 
 - Added `summary::mail::MIME_DEPTH_MAX` (64), the deepest multipart level the walk of a message's parts opens.
+- Added `PimdirStore::open_current(dir)`, an owner open that creates, migrates and reconciles nothing (pimdir STORAGE §6): a store absent, at another `user_version` or whose schema text differs from the canonical one is refused as `PimdirError::NotCurrent(PimdirNotCurrent::{Absent, Version { found }, Shape { object }})`, writing nothing, so a program owning the store for one write never rebuilds a store another owner keeps.
+- Added an `add` superseding an item (pimdir STORAGE §15.3): `PimdirAction::Add::supersedes`, `codec::PimdirSupersedes { collection, seq }`. The drain applies the add and tombstones the superseded item in one transaction, parking the whole action when the add parks, and records the pair (`supersede_item`); the sync holds the superseded tombstone's delete while the add's create is pending (`PimdirLoaded::held`, `list_superseded_pending`), so a refused create keeps the item on its server; the gate reads the superseded item's `remove` beside the add; the reader's overlay hides it while the add is queued.
+- Added `capability::X_VTODO` (`x-vtodo`, pimdir STORAGE §15.6): a source stating `none` on a calendar collection, or source-wide, refuses a VTODO there at the gate and at the drain, a source stating nothing refusing nothing; `PimdirReader::accepts_vtodo(collection)` answers it, and `capability::is_vtodo` and `capability::check_vtodo` are the pieces.
+- Added `PimdirReader::replied(message_ids)` (pimdir `list_replied`): which of the given bare ids a live mail outside the `sent` and `drafts` roles replies to.
 
 ### Changed
 
+- Changed `PimdirAction::Add` to carry `supersedes: Option<PimdirSupersedes>`, which a struct literal now names (`None` for a plain add), and `PimdirLoaded` to carry `held`.
 - Changed `PimdirWriteOp::SetRoundCursor::cursor` to an `Option<PimdirCursor>`, `None` keeping the cursor a page landed, and the vendored `set_round_cursor` to coalesce it (pimdir draft-04, STORAGE §10). Added `PimdirListing::Head` and two `PimdirEnumerated` variants, which an exhaustive match must now handle. **Breaking.**
 - Changed piped `--json` output of `pimdir` to print one value per line, each schema of `json-schema` to carry an `$id` naming the contract version (`v0.8`), and added `pimdir-error`, the schema of the JSON failure object (pimalaya-cli `55b6693`).
 - Changed `pimdir collection list --json` to print `{"collections": [...]}` instead of a bare array, so every payload is a JSON object (breaking).
 
 ### Fixed
 
+- Fixed a reader failing every task listing ("no such column: s.priority") on a store whose `task_summary` an owner at 3b4bed8 reconciled without `priority`, `categories`, `parent` and `mid`: the reader and the query client read each missing column as `NULL` (pimdir STORAGE §6).
 - Fixed a mail row holding a body with columns read without it (pimdir Annex A.1). A body entering the store now states, in the write, the mark and invitation its walk gives over the writer's; a placement linked to a body the account already holds (an upgrade linking from the store, a copy, a move, a second label) takes the body's size and a held row's mark and invitation, where it kept its listing's guess forever. A body whose held rows state no mark (rows written before marks were read off bodies, as in every store an older writer filled) is walked from its blob for the mark and the invitation of the new row alone, recording no stand-in and leaving the held rows as they are, where the new row kept its listing's guess; a body missing from the blob store keeps the writer's mark.
 - Fixed the invitation of a quoted-printable or base64 calendar part holding octets that are no UTF-8: the transfer encoding is now undone on the octets, before they are read as text.
 

@@ -19,7 +19,7 @@ use alloc::{
 use rusqlite::types::Value;
 
 use crate::{
-    client::search::PimdirSearchSort,
+    client::{schema, search::PimdirSearchSort},
     search::query::{
         PimdirQuery, PimdirQueryDate, PimdirQueryDateRange, PimdirQueryDateUnit, PimdirQueryId,
         PimdirQueryKind, PimdirQueryPredicate, PimdirQueryPriority, PimdirQueryTerm,
@@ -63,12 +63,21 @@ pub(crate) struct Compiled {
     ends: Ends,
     /// The instant relative dates resolve against, Unix seconds.
     now: i64,
+    /// The `task_summary` columns the attached store lacks, read as `NULL`
+    /// (STORAGE §6).
+    missing: Vec<&'static str>,
 }
 
 impl Compiled {
     /// Compiles a query, `ends` holding the items each `linked:` term
-    /// names, its relative dates resolved against `now` (Unix seconds).
-    pub(crate) fn new(query: &PimdirQuery, ends: Ends, now: i64) -> Self {
+    /// names, its relative dates resolved against `now` (Unix seconds),
+    /// `missing` the `task_summary` columns the store lacks.
+    pub(crate) fn new(
+        query: &PimdirQuery,
+        ends: Ends,
+        missing: Vec<&'static str>,
+        now: i64,
+    ) -> Self {
         let undated: Vec<&str> = query
             .terms()
             .into_iter()
@@ -86,6 +95,7 @@ impl Compiled {
             words: Vec::new(),
             ends,
             now,
+            missing,
         };
         compiled.condition = compiled.node(query, false, &undated);
         compiled
@@ -326,20 +336,28 @@ FROM hits h ORDER BY {order} LIMIT {limit} OFFSET {offset};",
                     PimdirQueryPriority::Low => "s.priority BETWEEN 6 AND 9",
                     PimdirQueryPriority::None => "ifnull(s.priority, 0) = 0",
                 };
-                format!(
-                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
-                     WHERE s.collection = i.collection AND s.link_id = i.link_id AND {band})"
+                // NOTE: a store whose owner predates the column reads it as
+                // NULL (STORAGE §6), every task then of no priority.
+                schema::nulled(
+                    &format!(
+                        "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                         WHERE s.collection = i.collection AND s.link_id = i.link_id AND {band})"
+                    ),
+                    &self.missing,
                 )
             }
             PimdirQueryPredicate::Category(category) => {
                 // NOTE: both sides folded as STORAGE Annex A.2 folds `fn`,
                 // the stored side by the function the connection registers.
                 let category = self.bind(fold(category).into());
-                format!(
-                    "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
-                     JOIN json_each(s.categories) j \
-                     WHERE s.collection = i.collection AND s.link_id = i.link_id \
-                     AND {FOLD}(j.value) = {category})"
+                schema::nulled(
+                    &format!(
+                        "SELECT i.collection, i.seq {live} AND EXISTS (SELECT 1 FROM store.task_summary s \
+                         JOIN json_each(s.categories) j \
+                         WHERE s.collection = i.collection AND s.link_id = i.link_id \
+                         AND {FOLD}(j.value) = {category})"
+                    ),
+                    &self.missing,
                 )
             }
             PimdirQueryPredicate::Account(account) => {

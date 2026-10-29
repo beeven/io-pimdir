@@ -595,6 +595,7 @@ fn run(harness: &mut Harness, op: &Op) -> Reached {
                     link_id: Some(PimdirLinkId(LINKS[link].into())),
                     flags: PimdirFlags::default(),
                     object: hash.clone(),
+                    supersedes: None,
                 }),
             };
 

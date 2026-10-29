@@ -283,6 +283,7 @@ fn add(producer: &PimdirProducer, body: &str) -> (PimdirAction, PimdirObject) {
         link_id: None,
         flags: PimdirFlags::default(),
         object: Some(hash.clone()),
+        supersedes: None,
     };
     (
         action,
@@ -441,6 +442,7 @@ fn a_copy_is_asked_of_the_sender_and_filed_once_sent() {
         link_id: None,
         flags: PimdirFlags::from_iter(["\\Seen"]),
         object: Some(object.hash.clone()),
+        supersedes: None,
     };
     assert!(store.replace_action(id, "owner", "Archive", &copy).unwrap());
     assert!(!store.replace_action(id, "owner", "Archive", &copy).unwrap());
@@ -618,4 +620,171 @@ fn an_occurrence_is_answered_only_by_a_performer_declaring_it() {
     else {
         panic!("a malformed occurrence is refused");
     };
+}
+
+const TODO: &str = "BEGIN:VCALENDAR\r\nBEGIN:VTODO\r\nUID:t1\r\nDTSTAMP:20261028T090000Z\r\nSUMMARY:Call Ann\r\nCATEGORIES:inbox\r\nEND:VTODO\r\nEND:VCALENDAR\r\n";
+const EVENT: &str = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:e9\r\nDTSTART:20261010T090000Z\r\nSUMMARY:Lunch\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+
+/// Source caldav syncing Tasks, holding task t0, and Events, declared with
+/// every calendar capability and `x-vtodo` `none` on Events alone.
+fn events_only(dir: &Path) -> i64 {
+    seeded_event(dir, "caldav", "Events", "e0");
+    let mut store = PimdirStore::open(dir).unwrap().for_source("caldav");
+    store.ensure_collection("Tasks", "text/calendar").unwrap();
+    let body = TODO.replace("UID:t1", "UID:t0");
+    let hash = PimdirHash("t0-hash".into());
+    store
+        .write(vec![
+            PimdirWriteOp::StoreObject {
+                object: PimdirObject {
+                    hash: hash.clone(),
+                    size: body.len(),
+                },
+                body: Some(body.into_bytes()),
+            },
+            PimdirWriteOp::UpsertPlacement(PimdirPlacement {
+                sort_key: Default::default(),
+                collection: PimdirCollectionId("Tasks".into()),
+                handle: PimdirHandle("t0".into()),
+                link_id: Some(PimdirLinkId("t0".into())),
+                object: Some(hash.clone()),
+                level: PimdirLevel::Full,
+                summary: None,
+                flags: PimdirFlags::default(),
+                status: PimdirStatus::Clean,
+                conflict_revision: None,
+                conflict_object: None,
+                base: Some(PimdirBase {
+                    flags: PimdirFlags::default(),
+                    revision: None,
+                    object: Some(hash),
+                }),
+                origin: None,
+            }),
+        ])
+        .unwrap();
+    store.list_items("Tasks", None, 10).unwrap()[0].seq
+}
+
+fn refuse_tasks(store: &mut PimdirStore) {
+    let mut rows = calendar(&[]);
+    rows.push(PimdirCapability {
+        collection: Some("Events".into()),
+        name: capability::X_VTODO.into(),
+        support: PimdirSupport::None,
+        detail: Some("events only".into()),
+    });
+    store.declare("caldav", &rows).unwrap();
+}
+
+#[test]
+fn a_calendar_refusing_tasks_refuses_a_task_and_takes_an_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = events_only(dir.path());
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    refuse_tasks(&mut store);
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, TODO);
+    let Err(PimdirError::Unsupported(refusal)) = producer.enqueue("Events", &action, Some(&object))
+    else {
+        panic!("a task into an events-only calendar should be refused");
+    };
+    assert_eq!(refusal.capability, capability::X_VTODO);
+    assert_eq!(refusal.source, "caldav");
+    assert_eq!(refusal.detail.as_deref(), Some("events only"));
+
+    let (action, object) = add(&producer, EVENT);
+    producer.enqueue("Events", &action, Some(&object)).unwrap();
+    let (action, object) = add(&producer, TODO);
+    producer.enqueue("Tasks", &action, Some(&object)).unwrap();
+
+    let into_events = PimdirAction::Move {
+        seq: task,
+        to: PimdirCollectionId("Events".into()),
+    };
+    let Err(PimdirError::Unsupported(refusal)) = producer.enqueue("Tasks", &into_events, None)
+    else {
+        panic!("moving a task into an events-only calendar should be refused");
+    };
+    assert_eq!(refusal.capability, capability::X_VTODO);
+
+    let reader = io_pimdir::client::reader::PimdirReader::open(dir.path()).unwrap();
+    assert!(!reader.accepts_vtodo("Events").unwrap());
+    assert!(reader.accepts_vtodo("Tasks").unwrap());
+}
+
+#[test]
+fn the_owner_parks_a_task_into_a_calendar_refusing_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    events_only(dir.path());
+
+    // NOTE: enqueued while the source was undeclared, then declared.
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, TODO);
+    producer.enqueue("Events", &action, Some(&object)).unwrap();
+    drop(producer);
+    let mut store = PimdirStore::open(dir.path()).unwrap().for_source("caldav");
+    refuse_tasks(&mut store);
+
+    let report = store.drain().unwrap();
+    assert_eq!(report.parked, 1);
+    assert!(
+        store.parked_actions().unwrap()[0]
+            .error
+            .contains(capability::X_VTODO)
+    );
+}
+
+#[test]
+fn a_source_stating_no_x_vtodo_row_refuses_no_task() {
+    let dir = tempfile::tempdir().unwrap();
+    events_only(dir.path());
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store.declare("caldav", &calendar(&[])).unwrap();
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, TODO);
+    producer.enqueue("Events", &action, Some(&object)).unwrap();
+}
+
+#[test]
+fn a_superseding_add_needs_the_remove_of_what_it_supersedes() {
+    let dir = tempfile::tempdir().unwrap();
+    let task = events_only(dir.path());
+    let mut store = PimdirStore::open(dir.path()).unwrap();
+    store
+        .declare("caldav", &calendar(&[capability::CALENDAR_ITEM_REMOVE]))
+        .unwrap();
+    drop(store);
+
+    let mut producer = PimdirProducer::open(dir.path(), "test").unwrap();
+    let (action, object) = add(&producer, TODO);
+    producer.enqueue("Tasks", &action, Some(&object)).unwrap();
+    let PimdirAction::Add {
+        link_id,
+        flags,
+        object: hash,
+        ..
+    } = action
+    else {
+        unreachable!();
+    };
+    let superseding = PimdirAction::Add {
+        link_id,
+        flags,
+        object: hash,
+        supersedes: Some(io_pimdir::codec::PimdirSupersedes {
+            collection: PimdirCollectionId("Tasks".into()),
+            seq: task,
+        }),
+    };
+    let Err(PimdirError::Unsupported(refusal)) =
+        producer.enqueue("Tasks", &superseding, Some(&object))
+    else {
+        panic!("superseding an item its source cannot remove should be refused");
+    };
+    assert_eq!(refusal.capability, capability::CALENDAR_ITEM_REMOVE);
 }

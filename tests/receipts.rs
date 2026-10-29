@@ -38,6 +38,7 @@ fn add(producer: &PimdirProducer, body: &str) -> (PimdirAction, PimdirObject) {
         link_id: None,
         flags: PimdirFlags::from_iter(["\\Draft"]),
         object: Some(hash.clone()),
+        supersedes: None,
     };
     (
         action,
@@ -320,6 +321,7 @@ fn a_replaced_intent_reads_applied_and_its_change_is_followed_apart() {
         link_id: None,
         flags: PimdirFlags::from_iter(["\\Seen"]),
         object: Some(object.hash.clone()),
+        supersedes: None,
     };
     assert!(owner.replace_action(id, "owner", "Drafts", &copy).unwrap());
     assert!(!owner.replace_action(id, "owner", "Drafts", &copy).unwrap());

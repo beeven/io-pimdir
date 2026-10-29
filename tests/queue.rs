@@ -111,6 +111,7 @@ fn a_queued_add_round_trips_into_a_staged_item() {
         link_id: Some(PimdirLinkId("mid:new".into())),
         flags: PimdirFlags::from_iter(["\\Draft"]),
         object: Some(PimdirHash("beef0000".into())),
+        supersedes: None,
     };
     producer.enqueue("INBOX", &add, Some(&object)).unwrap();
 
@@ -159,6 +160,7 @@ fn a_duplicate_add_parks_instead_of_clobbering() {
         link_id: Some(PimdirLinkId("mid:a".into())),
         flags: PimdirFlags::default(),
         object: None,
+        supersedes: None,
     };
     producer.enqueue("INBOX", &add, None).unwrap();
 
@@ -406,6 +408,7 @@ fn gc_never_sweeps_a_queued_body() {
                 link_id: Some(PimdirLinkId("mid:new".into())),
                 flags: PimdirFlags::default(),
                 object: Some(PimdirHash("beef0000".into())),
+                supersedes: None,
             },
             Some(&object),
         )
@@ -727,6 +730,7 @@ fn a_drain_applies_an_action_as_the_source_of_its_collection() {
                 link_id: Some(PimdirLinkId("mid:queued".into())),
                 flags: PimdirFlags::default(),
                 object: None,
+                supersedes: None,
             },
             None,
         )
@@ -786,6 +790,7 @@ fn a_store_failure_parks_the_row_and_the_pass_continues() {
                 link_id: Some(PimdirLinkId("mid:a".into())),
                 flags: PimdirFlags::default(),
                 object: None,
+                supersedes: None,
             },
             None,
         )
@@ -966,6 +971,7 @@ fn an_action_naming_an_unindexed_body_is_refused_at_the_enqueue() {
         link_id: Some(PimdirLinkId("mid:new".into())),
         flags: PimdirFlags::default(),
         object: Some(PimdirHash("beef0000".into())),
+        supersedes: None,
     };
 
     assert!(matches!(
