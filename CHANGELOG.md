@@ -53,6 +53,8 @@ All notable changes to this project are documented in this file. The format is b
 - Added `capability::X_VTODO` (`x-vtodo`, pimdir STORAGE §15.6): a source stating `none` on a calendar collection, or source-wide, refuses a VTODO there at the gate and at the drain, a source stating nothing refusing nothing; `PimdirReader::accepts_vtodo(collection)` answers it, and `capability::is_vtodo` and `capability::check_vtodo` are the pieces.
 - Added `PimdirReader::replied(message_ids)` (pimdir `list_replied`): which of the given bare ids a live mail outside the `sent` and `drafts` roles replies to.
 
+- Added the optional `charset-tables` feature (off by default, adding encoding_rs 0.8 alloc-only): `summary::mail::charset_decode` consults the WHATWG label table through `Encoding::for_label_no_replacement` before the lossy fallback, decoding `decode_without_bom_handling` so the label holds against a byte-order mark; gbk, big5, euc-jp, iso-2022-jp, shift_jis, euc-kr, the windows-125x and iso-8859-x rows and utf-16 decode through their tables, while a label the table names with no encoding behind it (iso-2022-kr among them) or does not name at all reads as UTF-8, lossily, exactly as the byte-for-byte unchanged default build (pimdir STORAGE Annex A.0).
+
 ### Changed
 
 - Changed `PimdirAction::Add` to carry `supersedes: Option<PimdirSupersedes>`, which a struct literal now names (`None` for a plain add), and `PimdirLoaded` to carry `held`.
